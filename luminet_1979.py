@@ -287,21 +287,14 @@ if len(sx):
 #    size varying from dot to dot, on dark charcoal paper rather than pure black.
 PAPER, INK = '#221f1b', '#ece7cf'      # warm dark gray paper, cream ink
 RES_SCALE = 2                                          # output resolution multiplier (1 = 2800x1400 px)
-DPI, BASE = 200 * RES_SCALE, 1.5                                   # BASE = typical dot diameter in points
+BASE = 1.5                                             # typical dot diameter in points
+FIG_W, FIG_H = 14, 7                                   # figure size in inches (2*VIEW x VIEW in M)
 size = BASE * rng.lognormal(0, 0.10, len(dots))
 ang = rng.uniform(0, 2 * np.pi, len(dots)); off = rng.uniform(0.08, 0.25, len(dots))
-pt_to_M = 2*VIEW / (14 * 72)                               # figure is 14 in wide for 2*VIEW M
+pt_to_M = 2*VIEW / (FIG_W * 72)                        # figure is 14 in wide for 2*VIEW M
 lobe = dots + np.column_stack([np.cos(ang), np.sin(ang)]) * (off * size * pt_to_M)[:, None]
-fig = plt.figure(figsize=(14, 7), facecolor=PAPER)
-ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor(PAPER)
-ax.scatter(dots[:, 0], dots[:, 1], s=size**2, c=INK, linewidths=0)
-ax.scatter(lobe[:, 0], lobe[:, 1], s=(0.7 * size)**2, c=INK, linewidths=0)
-ax.set_xlim(-VIEW, VIEW); ax.set_ylim(-VIEW/2, VIEW/2); ax.axis('off')
-fig.savefig('luminet_recreation.png', dpi=DPI, facecolor=PAPER)
-# Soften edges slightly, like ink soaking into paper
+LOBE_SCALE = 0.7                                       # lobe diameter relative to its dot
 INK_BLUR = 0.35                                        # blur radius in pixels at RES_SCALE = 1
-from PIL import Image, ImageFilter
-Image.open('luminet_recreation.png').filter(ImageFilter.GaussianBlur(INK_BLUR * RES_SCALE)).save('luminet_recreation.png')
 
 # --- 5. Paper and photographic texture ---
 # The original isn't flat black: paper fibers, ink wicking and the photographic
@@ -310,17 +303,16 @@ Image.open('luminet_recreation.png').filter(ImageFilter.GaussianBlur(INK_BLUR * 
 TEXTURE = True
 GRAIN, MOTTLE, DRIFT = 3.5, 2.1, 2.8     # strength of each layer, in 0-255 brightness levels
 EDGE_ROUGHNESS = 0.07                    # how much fiber texture eats into dot edges
-if TEXTURE:
-    img = np.asarray(Image.open('luminet_recreation.png').convert('RGB')).astype(np.float32)
-    paper = np.array([int(PAPER[i:i+2], 16) for i in (1, 3, 5)], float)
-    ink = np.array([int(INK[i:i+2], 16) for i in (1, 3, 5)], float)
-    # how much ink each pixel holds, 0 = bare paper, 1 = solid dot
-    m = np.clip(((img - paper) @ (ink - paper)) / ((ink - paper) @ (ink - paper)), 0, 1)
-    h_, w_ = m.shape
+PAPER_RGB = np.array([int(PAPER[i:i+2], 16) for i in (1, 3, 5)], float)
+INK_RGB = np.array([int(INK[i:i+2], 16) for i in (1, 3, 5)], float)
+
+def texture_layers(h_, w_, res_scale):
+    """Fixed noise fields (grain, mottle, drift) for an h_ x w_ image."""
+    from PIL import Image
     trng = np.random.default_rng(7)
     def noise(sigma):
         # pixel sigmas are given at RES_SCALE = 1; large ones are made at low resolution and upsampled
-        sigma = sigma * RES_SCALE
+        sigma = sigma * res_scale
         f = max(1, int(sigma // 8))
         n = trng.normal(size=(h_ // f + 1, w_ // f + 1)).astype(np.float32)
         n = ndimage.gaussian_filter(n, sigma / f)
@@ -331,10 +323,42 @@ if TEXTURE:
     grain = noise(0.8)                   # paper fibers / film grain
     mottle = noise(5)                    # patchy unevenness a few dots across
     drift = noise(140)                   # slow exposure variation across the print
-    # rough, fibrous dot edges: perturb the ink mask most where it is partial (edges)
-    m = np.clip(m + EDGE_ROUGHNESS * grain * 4 * m * (1 - m), 0, 1)
-    paper_tex = paper[None, None, :] + (GRAIN * grain + MOTTLE * mottle + DRIFT * drift)[..., None]
-    ink_tex = ink[None, None, :] * (1 + 0.01 * grain + 0.02 * drift)[..., None]
-    out = paper_tex * (1 - m[..., None]) + ink_tex * m[..., None]
-    Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save('luminet_recreation.png')
-print("candidates:", len(pts), " dots drawn:", len(dots))
+    return grain, mottle, drift
+
+class Texturer:
+    """Turns an ink-coverage map m (0 = bare paper, 1 = solid dot) into the final RGB image."""
+    def __init__(self, h_, w_, res_scale):
+        grain, mottle, drift = texture_layers(h_, w_, res_scale)
+        self.rough = EDGE_ROUGHNESS * grain * 4
+        self.paper = PAPER_RGB[None, None, :] + (GRAIN * grain + MOTTLE * mottle + DRIFT * drift)[..., None]
+        self.ink = INK_RGB[None, None, :] * (1 + 0.01 * grain + 0.02 * drift)[..., None]
+    def __call__(self, m):
+        return self.patch(m, (slice(None), slice(None)))
+    def patch(self, m, region):
+        """Texture just the pixels in region (a pair of slices); m covers that region."""
+        # rough, fibrous dot edges: perturb the ink mask most where it is partial (edges)
+        m = np.clip(m + self.rough[region] * m * (1 - m), 0, 1)
+        out = self.paper[region] * (1 - m[..., None]) + self.ink[region] * m[..., None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+def ink_coverage(img):
+    """How much ink each pixel of an RGB image holds, 0 = bare paper, 1 = solid dot."""
+    d = INK_RGB - PAPER_RGB
+    return np.clip(((img - PAPER_RGB) @ d) / (d @ d), 0, 1)
+
+if __name__ == '__main__':
+    from PIL import Image, ImageFilter
+    DPI = 200 * RES_SCALE
+    fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor=PAPER)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_facecolor(PAPER)
+    ax.scatter(dots[:, 0], dots[:, 1], s=size**2, c=INK, linewidths=0)
+    ax.scatter(lobe[:, 0], lobe[:, 1], s=(LOBE_SCALE * size)**2, c=INK, linewidths=0)
+    ax.set_xlim(-VIEW, VIEW); ax.set_ylim(-VIEW/2, VIEW/2); ax.axis('off')
+    fig.savefig('luminet_recreation.png', dpi=DPI, facecolor=PAPER)
+    # Soften edges slightly, like ink soaking into paper
+    Image.open('luminet_recreation.png').filter(ImageFilter.GaussianBlur(INK_BLUR * RES_SCALE)).save('luminet_recreation.png')
+    if TEXTURE:
+        img = np.asarray(Image.open('luminet_recreation.png').convert('RGB')).astype(np.float32)
+        m = ink_coverage(img)
+        Image.fromarray(Texturer(*m.shape, RES_SCALE)(m)).save('luminet_recreation.png')
+    print("candidates:", len(pts), " dots drawn:", len(dots))
