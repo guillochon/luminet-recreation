@@ -21,11 +21,14 @@ This writes `luminet_recreation.png` (5600 × 2800 px by default) to the current
 python luminet_animation.py
 ```
 
-This writes `luminet_animation.mp4`, a 60 fps video of the drawing being inked one dot at a time, at half the still's resolution (2800 × 1400 px). It needs `ffmpeg` on your PATH. With one dot per frame, the 24,454 dots take about 6.8 minutes; `--dots-per-frame 4` gives a video about a quarter as long. Run `python luminet_animation.py --help` for all options.
+This writes `luminet_animation.mp4`, a 60 fps video of the drawing being inked, at half the still's resolution (2800 × 1400 px). It needs `ffmpeg` on your PATH. At the default of 3 dots per frame, the 24,454 dots take about 2¼ minutes. Run `python luminet_animation.py --help` for all options, such as `--dots-per-frame`, `--dry-seconds` and `--texture`.
+
+- **Drying ink.** Each drop lands wet: about 15% smaller than its final size and domed like a droplet, lit from the upper left with a small glint. Over 5 seconds it flattens and spreads to its final size. When it's dry it is exactly the dot in the still.
+- **Lighter paper texture.** The video uses the paper grain and tone variation at half the still's strength (`--texture 0.5`). Use `--texture 1` to match the still.
 
 - **Drawing order.** Dots go down from the inside out, along a short pen path. The drawing is split into thin bands, each about two dot spacings wide. Near the hole the bands are circles; farther out they stretch to the frame's 2:1 shape. The pen sweeps around each band, alternating direction, so every band starts where the previous one ended. A traveling-salesman improvement step (2-opt) then shortens the route. The typical hop between consecutive dots is 0.15 M, close to the 0.12 M spacing between neighboring dots.
-- **Same image as the still.** Each frame is built the same way as the still: same dots, same blur, same paper texture. The last frame matches a half-resolution render of the still.
-- **Video compression.** Thousands of tiny dots on grainy paper are hard for a video encoder. Three settings deal with that. First, the paper texture stays fixed from frame to frame, so each frame differs from the last only by the new dot, which keeps the video small. Second, the H.264 encoder runs at high quality (CRF 12) with `-tune grain`, so it doesn't smooth away the grain or the dot edges. Third, the file uses an explicit, tagged BT.709 color conversion, so players don't shift the colors. Use `--lossless` for an exact RGB master (`.mkv`) to re-encode from, or `--pix-fmt yuv444p` for full color resolution.
+- **Same image as the still.** Each frame is built the same way as the still: same dots, same blur, same paper texture. With `--texture 1`, the last frame matches a half-resolution render of the still.
+- **Video compression.** Thousands of tiny dots on grainy paper are hard for a video encoder. Three settings deal with that. First, the paper texture stays fixed from frame to frame, so each frame differs from the last only around the drops that are still drying, which keeps the video small. Second, the H.264 encoder runs at high quality (CRF 12) with `-tune grain`, so it doesn't smooth away the grain or the dot edges. Third, the file uses an explicit, tagged BT.709 color conversion, so players don't shift the colors. Use `--lossless` for an exact RGB master (`.mkv`) to re-encode from, or `--pix-fmt yuv444p` for full color resolution.
 
 ## How it works
 

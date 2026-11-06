@@ -327,8 +327,10 @@ def texture_layers(h_, w_, res_scale):
 
 class Texturer:
     """Turns an ink-coverage map m (0 = bare paper, 1 = solid dot) into the final RGB image."""
-    def __init__(self, h_, w_, res_scale):
+    def __init__(self, h_, w_, res_scale, strength=1.0):
+        # strength scales every texture effect (grain, mottle, tonal drift, rough edges)
         grain, mottle, drift = texture_layers(h_, w_, res_scale)
+        grain, mottle, drift = strength * grain, strength * mottle, strength * drift
         self.rough = EDGE_ROUGHNESS * grain * 4
         self.paper = PAPER_RGB[None, None, :] + (GRAIN * grain + MOTTLE * mottle + DRIFT * drift)[..., None]
         self.ink = INK_RGB[None, None, :] * (1 + 0.01 * grain + 0.02 * drift)[..., None]

@@ -1,5 +1,5 @@
 """
-Animate the Luminet recreation being inked, one dot at a time.
+Animate the Luminet recreation being inked, a few dots at a time.
 
 Dots are drawn from the inside out along a short pen path: the drawing is split
 into thin contour bands around the hole (circles near the hole, stretching to
@@ -7,14 +7,18 @@ the frame's 2:1 shape farther out), each band is swept around in alternating
 directions, and the whole route is then shortened with 2-opt, a standard
 traveling-salesman improvement step.
 
-Output is 60 fps at half the still's DPI (2800 x 1400 px). Each frame is built
-exactly like the still: ink is stamped into a coverage map, softened with the
-same blur and given the same paper texture. The texture is fixed from frame to
-frame, so the only change between frames is the new dot. That keeps the
-encoder's job easy: it spends its bits on the dots instead of on noise.
+Each drop lands wet: a little smaller than its final size and domed, so it is
+shaded like a droplet with a small glint. Over a few seconds it flattens and
+spreads to its final size, ending exactly as the dry dot in the still.
 
-    python luminet_animation.py                   # full video, one dot per frame
-    python luminet_animation.py --dots-per-frame 4
+Output is 60 fps at half the still's DPI (2800 x 1400 px). Frames are built like
+the still: ink is stamped into a coverage map, softened with the same blur and
+given the paper texture (at half strength by default). The texture is fixed from
+frame to frame, so only the drops change. That keeps the encoder's job easy: it
+spends its bits on the dots instead of on noise.
+
+    python luminet_animation.py                   # full video, 3 dots per frame
+    python luminet_animation.py --dots-per-frame 1
     python luminet_animation.py --seconds 10      # quick preview of the start
 """
 import argparse
@@ -118,21 +122,21 @@ def drawing_order(P, half_height):
 
 
 # --- Ink stamps --------------------------------------------------------------
-SUPERSAMPLE = 8          # subsamples per pixel side for antialiased dot edges
+SUPERSAMPLE = 8          # subsamples per pixel side for antialiased dry dot edges
+WET_SUPERSAMPLE = 6      # ...and for the wet drops (cheaper; they are always changing)
+WET_LEVELS = 12          # wetness levels precomputed per drop; frames interpolate between them
+
+# How a wet drop looks. Wetness w runs from 1 (just landed) to 0 (dry).
+WET_SHRINK = 0.15        # a fresh drop is this much smaller than its final size
+DOME = 0.6               # height / radius of a fresh drop; it flattens as it dries
+LIGHT = np.array([-0.55, -0.65, 1.0]) / np.linalg.norm([-0.55, -0.65, 1.0])   # from upper left (x right, y down, z to viewer)
+HALF = (LIGHT + [0, 0, 1]) / np.linalg.norm(LIGHT + [0, 0, 1])
+DIFFUSE = 0.55           # how strongly the dome's slope lightens / darkens the ink
+GLINT, GLINT_POWER = 0.45, 14   # specular highlight strength and tightness
 
 
-def disk_coverage(cy, cx, radius, r0, c0, K):
-    """Fraction of each pixel in the K x K patch at (r0, c0) covered by each disk."""
-    s = (np.arange(SUPERSAMPLE) + 0.5) / SUPERSAMPLE
-    sub = (np.arange(K)[:, None] + s[None, :]).ravel()          # subsample offsets along one axis
-    yy = r0[:, None] + sub[None, :] - cy[:, None]               # (n, K*S)
-    xx = c0[:, None] + sub[None, :] - cx[:, None]
-    inside = yy[:, :, None]**2 + xx[:, None, :]**2 <= radius[:, None, None]**2
-    return inside.reshape(len(cy), K, SUPERSAMPLE, K, SUPERSAMPLE).mean(axis=(2, 4)).astype(np.float32)
-
-
-def make_stamps(L, H, W, dpi):
-    """Per-dot ink coverage patches, matching matplotlib's scatter of dots and lobes."""
+def drop_geometry(L, H, W, dpi):
+    """Pixel positions and radii of every dot and its lobe, and the stamp grid."""
     px_pt = dpi / 72
     def to_px(xy):
         return (L.VIEW / 2 - xy[:, 1]) / L.VIEW * H, (xy[:, 0] + L.VIEW) / (2 * L.VIEW) * W
@@ -140,13 +144,67 @@ def make_stamps(L, H, W, dpi):
     r_dot = 0.5 * L.size * px_pt; r_lobe = 0.5 * L.LOBE_SCALE * L.size * px_pt
     K = int(np.ceil(2 * (r_dot.max() + np.hypot(cy - ly, cx - lx).max()))) + 3
     r0 = np.floor(cy - K / 2).astype(int) + 1; c0 = np.floor(cx - K / 2).astype(int) + 1
-    stamps = np.empty((len(cy), K, K), np.float32)
-    for s in range(0, len(cy), 2000):
-        sl = slice(s, s + 2000)
-        a_dot = disk_coverage(cy[sl], cx[sl], r_dot[sl], r0[sl], c0[sl], K)
-        a_lobe = disk_coverage(ly[sl], lx[sl], r_lobe[sl], r0[sl], c0[sl], K)
-        stamps[sl] = 1 - (1 - a_dot) * (1 - a_lobe)          # two overlapping opaque marks
-    return r0, c0, stamps
+    return dict(cy=cy, cx=cx, ly=ly, lx=lx, r_dot=r_dot, r_lobe=r_lobe, r0=r0, c0=c0, K=K)
+
+
+def drop_stamps(g, sl, w, S):
+    """Ink coverage, shading gain and glint for dots sl at wetness w, each a K x K
+    patch. A drop is the dot and its lobe, each a dome; the higher dome wins where
+    they overlap. At w = 0 the drop is flat and full size: exactly the dry dot."""
+    cy, cx, r0, c0, K = g['cy'][sl], g['cx'][sl], g['r0'][sl], g['c0'][sl], g['K']
+    s = 1 - WET_SHRINK * w
+    ly = cy + s * (g['ly'][sl] - cy); lx = cx + s * (g['lx'][sl] - cx)   # lobe moves in as the drop shrinks
+    R1 = (s * g['r_dot'][sl]).astype(np.float32); R2 = (s * g['r_lobe'][sl]).astype(np.float32)
+    sub = (np.arange(K)[:, None] + (np.arange(S) + 0.5) / S).ravel()
+    n = len(cy)
+    def dome(yc, xc, R):
+        dy = (r0[:, None] + sub[None, :] - yc[:, None]).astype(np.float32)[:, :, None]
+        dx = (c0[:, None] + sub[None, :] - xc[:, None]).astype(np.float32)[:, None, :]
+        q = (dy**2 + dx**2) / (R**2)[:, None, None]
+        return dx, dy, q, q <= 1
+    pool = lambda v: v.reshape(n, K, S, K, S).mean(axis=(2, 4), dtype=np.float32)
+    dx1, dy1, q1, in1 = dome(cy, cx, R1)
+    dx2, dy2, q2, in2 = dome(ly, lx, R2)
+    a = 1 - (1 - pool(in1)) * (1 - pool(in2))         # two overlapping opaque marks, as in the still
+    if w == 0:
+        z = np.zeros_like(a)
+        return a, z, z
+    h1 = np.where(in1, np.sqrt(np.maximum(1 - q1, 0)) * R1[:, None, None], -1)
+    h2 = np.where(in2, np.sqrt(np.maximum(1 - q2, 0)) * R2[:, None, None], -1)
+    use1 = h1 >= h2
+    def slope(dx, dy, q, R):          # gradient of the dome height DOME*w * R * sqrt(1 - q)
+        k = -DOME * w / (R[:, None, None] * np.sqrt(np.maximum(1 - q, 0.04)))
+        return k * dx, k * dy
+    hx1, hy1 = slope(dx1, dy1, q1, R1); hx2, hy2 = slope(dx2, dy2, q2, R2)
+    hx = np.where(use1, hx1, hx2); hy = np.where(use1, hy1, hy2)
+    nz = 1 / np.sqrt(1 + hx**2 + hy**2)
+    nx, ny = -hx * nz, -hy * nz
+    lit = np.maximum(nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2], 0)
+    gain = DIFFUSE * (lit / LIGHT[2] - 1)              # 0 on a flat surface
+    spec = np.maximum(nx * HALF[0] + ny * HALF[1] + nz * HALF[2], 0)
+    glint = GLINT * w * np.maximum(spec**GLINT_POWER - HALF[2]**GLINT_POWER, 0)
+    inside = in1 | in2
+    return a, pool(inside * gain), pool(inside * glint)
+
+
+class Stamps:
+    """Dry stamps (float32), plus wet stamps at WET_LEVELS wetness levels (float16).
+    Made in chunks just before the drops land, so previews only pay for what they show."""
+    CHUNK = 300
+    def __init__(self, g):
+        self.g = g; N, K = len(g['cy']), g['K']
+        self.dry = np.empty((N, K, K), np.float32)
+        self.A = np.empty((N, WET_LEVELS, K, K), np.float16)
+        self.G = np.zeros_like(self.A); self.SP = np.zeros_like(self.A)
+        self.ready = 0
+    def ensure(self, upto):
+        while self.ready < min(upto, len(self.dry)):
+            sl = slice(self.ready, self.ready + self.CHUNK)
+            self.dry[sl] = drop_stamps(self.g, sl, 0.0, SUPERSAMPLE)[0]
+            self.A[sl, 0] = self.dry[sl]
+            for j, w in enumerate(np.linspace(0, 1, WET_LEVELS)[1:], 1):
+                self.A[sl, j], self.G[sl, j], self.SP[sl, j] = drop_stamps(self.g, sl, w, WET_SUPERSAMPLE)
+            self.ready += self.CHUNK
 
 
 # --- Encoding ------------------------------------------------------------------
@@ -173,14 +231,21 @@ def ffmpeg_command(out, W, H, fps, args):
     return cmd + [out]
 
 
+def smoothstep(t):
+    t = np.clip(t, 0, 1)
+    return t * t * (3 - 2 * t)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', default=None, help='output file (default luminet_animation.mp4, or .mkv with --lossless)')
     ap.add_argument('--fps', type=int, default=60)
-    ap.add_argument('--dots-per-frame', type=float, default=1.0,
-                    help='dots added per frame (1 = one dot per frame, about 6.8 minutes)')
+    ap.add_argument('--dots-per-frame', type=float, default=3.0, help='dots added per frame')
+    ap.add_argument('--dry-seconds', type=float, default=5.0, help='how long each drop takes to dry')
+    ap.add_argument('--texture', type=float, default=0.5,
+                    help='strength of the paper grain and tone, relative to the still (1 = same)')
     ap.add_argument('--hold-start', type=float, default=0.5, help='seconds of blank paper first')
-    ap.add_argument('--hold-end', type=float, default=4.0, help='seconds to hold the finished drawing')
+    ap.add_argument('--hold-end', type=float, default=4.0, help='seconds to hold the finished, dry drawing')
     ap.add_argument('--seconds', type=float, default=None, help='stop after this many seconds (for previews)')
     ap.add_argument('--crf', type=float, default=12, help='x264 quality: lower is better and bigger')
     ap.add_argument('--preset', default='slow', help='x264 speed/efficiency preset')
@@ -200,51 +265,104 @@ def main():
 
     print("Ordering dots...")
     order = drawing_order(L.dots, L.VIEW / 2)
-    r0, c0, stamps = make_stamps(L, H, W, dpi)
-    r0, c0, stamps = r0[order], c0[order], stamps[order]
-    K = stamps.shape[1]
+    print("Making ink stamps...")
+    geom = drop_geometry(L, H, W, dpi)
+    geom = {k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in geom.items()}
+    stamps = Stamps(geom)
+    dry, A, G, SP = stamps.dry, stamps.A, stamps.G, stamps.SP
+    r0, c0, K = geom['r0'], geom['c0'], geom['K']
 
-    tex = L.Texturer(H, W, RES)
+    tex = L.Texturer(H, W, RES, strength=args.texture)
     blur_sigma = L.INK_BLUR * RES
     reach = int(np.ceil(4 * blur_sigma))                  # gaussian_filter's kernel radius
-    P = K + 1                                             # padding so stamps never fall off the array
-    M = np.zeros((H + 2 * P, W + 2 * P), np.float32)      # raw ink coverage, before blur
+    P = K + 1                                             # padding so stamps never fall off the arrays
+    Hp, Wp = H + 2 * P, W + 2 * P
+    M = np.zeros((Hp, Wp), np.float32)                    # ink coverage of the dry dots, before blur
     m = M[P:-P, P:-P]
-    frame = tex(ndimage.gaussian_filter(m, blur_sigma))  # blank textured paper
+    base = tex(ndimage.gaussian_filter(m, blur_sigma))    # the frame with only the dry dots
+    # Wet drops are redrawn every frame: T is how much paper they leave showing,
+    # Gm and Sm their shading gain and glint.
+    T = np.ones((Hp, Wp), np.float32); Gm = np.zeros_like(T); Sm = np.zeros_like(T)
+    Tf, Gf, Sf = T.reshape(-1), Gm.reshape(-1), Sm.reshape(-1)
+    Ti, Gi, Si = T[P:-P, P:-P], Gm[P:-P, P:-P], Sm[P:-P, P:-P]
+    offsets = (np.arange(K)[:, None] * Wp + np.arange(K)[None, :]).ravel()
+    flat0 = (r0 + P) * Wp + (c0 + P)                      # flat index of each stamp's corner
 
-    def add_dot(i):
+    def render(region, wet=False):
+        """Blur + texture (+ wet drops and their shading) for one region of the frame.
+        Both steps are local, so this matches rendering the whole frame."""
+        ya, yb, xa, xb = region
+        wa, wb, va, vb = max(ya - reach, 0), min(yb + reach, H), max(xa - reach, 0), min(xb + reach, W)
+        cov = m[wa:wb, va:vb]
+        if wet:
+            cov = 1 - (1 - cov) * Ti[wa:wb, va:vb]
+        blurred = ndimage.gaussian_filter(cov, blur_sigma)[ya - wa:yb - wa, xa - va:xb - va]
+        rgb = tex.patch(blurred, (slice(ya, yb), slice(xa, xb)))
+        if wet:
+            gain, glint = Gi[ya:yb, xa:xb], Si[ya:yb, xa:xb]
+            rgb = np.clip(rgb * (1 + gain[..., None]) + 255 * glint[..., None], 0, 255).astype(np.uint8)
+        return rgb
+
+    def dry_dot(i):
         y0, x0 = r0[i] + P, c0[i] + P
-        M[y0:y0 + K, x0:x0 + K] = 1 - (1 - M[y0:y0 + K, x0:x0 + K]) * (1 - stamps[i])
-        # re-blur and re-texture only the pixels this dot can reach; identical to
-        # doing the whole frame, because both steps are local
-        ya, yb = max(r0[i] - reach, 0), min(r0[i] + K + reach, H)
-        xa, xb = max(c0[i] - reach, 0), min(c0[i] + K + reach, W)
-        if ya >= yb or xa >= xb:
-            return
-        wa, wb = max(ya - reach, 0), min(yb + reach, H)
-        va, vb = max(xa - reach, 0), min(xb + reach, W)
-        blurred = ndimage.gaussian_filter(m[wa:wb, va:vb], blur_sigma)[ya - wa:yb - wa, xa - va:xb - va]
-        sub = (slice(ya, yb), slice(xa, xb))
-        frame[sub] = tex.patch(blurred, sub)
+        M[y0:y0 + K, x0:x0 + K] = 1 - (1 - M[y0:y0 + K, x0:x0 + K]) * (1 - dry[i])
+        region = (max(r0[i] - reach, 0), min(r0[i] + K + reach, H), max(c0[i] - reach, 0), min(c0[i] + K + reach, W))
+        if region[0] < region[1] and region[2] < region[3]:
+            base[region[0]:region[1], region[2]:region[3]] = render(region)
+
+    TILE = 32                                             # must be >= K + 2 * reach
+    n_ty, n_tx = -(-H // TILE), -(-W // TILE)
 
     n = len(order)
-    n_draw = int(np.ceil(n / args.dots_per_frame))
-    n_frames = round(args.hold_start * args.fps) + n_draw + round(args.hold_end * args.fps)
+    start = round(args.hold_start * args.fps)
+    appear = start + np.floor(np.arange(n) / args.dots_per_frame + 1e-9).astype(int)   # frame each drop lands
+    dry_frames = max(1, round(args.dry_seconds * args.fps))
+    n_frames = appear[-1] + dry_frames + round(args.hold_end * args.fps)
     if args.seconds is not None:
         n_frames = min(n_frames, round(args.seconds * args.fps))
     print(f"{n_frames} frames ({n_frames / args.fps:.1f} s) -> {out}")
     enc = subprocess.Popen(ffmpeg_command(out, W, H, args.fps, args), stdin=subprocess.PIPE)
-    drawn = 0; t0 = time.time()
+    dried = 0; prev_idx = None; frame = base; t0 = time.time()
     for f in range(n_frames):
-        k = f - round(args.hold_start * args.fps) + 1    # drawing frames are numbered from 1
-        target = min(n, int(np.floor(k * args.dots_per_frame + 1e-9))) if k > 0 else 0
-        while drawn < target:
-            add_dot(drawn); drawn += 1
+        while dried < n and appear[dried] + dry_frames <= f:
+            dry_dot(dried); dried += 1
+        landed = np.searchsorted(appear, f, side='right')      # drops on the paper so far
+        stamps.ensure(landed)
+        if prev_idx is not None:                               # clear last frame's wet drops
+            Tf[prev_idx] = 1; Gf[prev_idx] = 0; Sf[prev_idx] = 0; prev_idx = None
+        wet = np.arange(dried, landed)
+        if len(wet) == 0:
+            frame = base
+        else:
+            wetness = 1 - smoothstep((f - appear[wet]) / dry_frames)
+            lv = wetness * (WET_LEVELS - 1)
+            lo = np.minimum(np.floor(lv).astype(int), WET_LEVELS - 2)
+            t = (lv - lo)[:, None, None].astype(np.float32)
+            a = A[wet, lo] * (1 - t) + A[wet, lo + 1] * t
+            gn = G[wet, lo] * (1 - t) + G[wet, lo + 1] * t
+            gl = SP[wet, lo] * (1 - t) + SP[wet, lo + 1] * t
+            idx = (flat0[wet][:, None] + offsets[None, :]).ravel()
+            np.multiply.at(Tf, idx, (1 - a).ravel())
+            np.add.at(Gf, idx, gn.ravel()); np.add.at(Sf, idx, gl.ravel())
+            prev_idx = idx
+            # rebuild only the tiles the wet drops (plus blur reach) touch; a tile is
+            # at least as big as a drop, so checking each drop's four corners finds them all
+            ya, yb = r0[wet] - reach, r0[wet] + K + reach
+            xa, xb = c0[wet] - reach, c0[wet] + K + reach
+            ty = np.clip(np.concatenate([ya, ya, yb, yb]) // TILE, 0, n_ty - 1)
+            tx = np.clip(np.concatenate([xa, xb, xa, xb]) // TILE, 0, n_tx - 1)
+            frame = base.copy()
+            for code in np.unique(ty * n_tx + tx):
+                y, x = divmod(int(code), n_tx)
+                region = (y * TILE, min((y + 1) * TILE, H), x * TILE, min((x + 1) * TILE, W))
+                frame[region[0]:region[1], region[2]:region[3]] = render(region, wet=True)
         enc.stdin.write(frame.tobytes())
+        if f % 600 == 0:
+            print(f"  frame {f}/{n_frames}, {len(wet)} wet drops, {time.time() - t0:.0f} s", flush=True)
     enc.stdin.close()
     if enc.wait() != 0:
         sys.exit("ffmpeg failed")
-    print(f"\nDone in {time.time() - t0:.0f} s: {drawn} of {n} dots drawn")
+    print(f"\nDone in {time.time() - t0:.0f} s: {min(landed, n)} of {n} dots landed, {dried} dry")
     if args.last_frame:
         from PIL import Image
         Image.fromarray(frame).save(args.last_frame)
