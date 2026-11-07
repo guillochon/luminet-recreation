@@ -29,11 +29,25 @@ python blackhole.py --params my_hole.json                  # a JSON file of para
 
 The order is: `--preset` (default `luminet1979`), then `--params`, then each `--set`. Next to the image, `blackhole.py` saves a `.json` file with every value used, so you can pass it back with `--params` to reproduce the image.
 
-- **Black hole and disk:** viewing angle (`inclination`, 0° face-on to 90° edge-on), disk inner and outer edge (`r_in` ≥ 6M, `r_out`), which side rotates toward you (`approaching_side`), the sharp inner edge, and Luminet's approximate ghost ring (`luminet_ghost`).
+- **Black hole and disk:** spin (`spin`, −0.998 to 0.998; see below), viewing angle (`inclination`, 0° face-on to 90° edge-on), disk inner and outer edge (`r_in`, which defaults to the innermost stable orbit for the spin, and `r_out`), which side rotates toward you (`approaching_side`), the sharp inner edge, and Luminet's approximate ghost ring (`luminet_ghost`).
 - **Frame:** zoom (`view`, the half-width in units of M) and shape (`aspect`). The black hole's mass only sets the length unit, so it isn't a parameter.
 - **Style:** dot density and contrast, isoradial banding, the hand-drawn inner ring, dot size and shape, colors, and paper texture.
-- **Presets:** `luminet1979`, `face-on`, `edge-on`, `truncated-disk` (r_in = 14M) and `luminet-ghost`.
-- **Physics limits:** the black hole doesn't spin (Schwarzschild), and the disk is thin and glows by the Page–Thorne formula.
+- **Presets:** `luminet1979`, `face-on`, `edge-on`, `truncated-disk` (r_in = 14M), `luminet-ghost`, `spinning` (spin 0.9), `retrograde` (spin −0.9) and `max-spin-edge-on` (spin 0.998 at 87°).
+- **Exposure:** the brightest point sets full dot density, as Luminet did. If that would leave less of the disk at full density than his drawing has, the image is brightened until it matches (`auto_exposure`); it is never darkened. This matters most for fast prograde spin, where a tiny region near the hole outshines the rest of the disk by up to ~100 times.
+- **Physics limits:** the disk is thin and on circular orbits, and glows by the Page–Thorne (Novikov–Thorne) formula. The observer is far away.
+
+#### Spin
+
+With `spin` at 0, light bending uses the same Schwarzschild code that recreates Luminet's image. With any other spin, every pixel's light ray is traced back through the Kerr geometry of a spinning hole. A ray's radial and polar motions separate when written in Mino time. They're integrated as two smooth equations, one in 1/r and one in cos θ, and the tracer records where each ray first and second crosses the disk plane. These crossings give the direct and secondary images, as before. The rays are split across several processes, so a frame takes about 30 seconds. The spin also changes the disk itself:
+
+- **Innermost stable orbit:** the disk's inner edge moves in to 1.24M at spin 0.998, or out to 9M when the hole spins against the disk.
+- **Brightness:** the Page–Thorne formula becomes its Kerr form (Novikov–Thorne).
+- **Redshift:** 1+z = u^t (1 − Ω ℓ) for a circular Kerr orbit.
+
+Positive spin turns the same way as the disk, and negative spin turns against it. Checks:
+
+- **Tiny spin:** at spin 10⁻⁶ the Kerr tracer agrees with the Schwarzschild code to about 10⁻⁵ in disk radius and brightness.
+- **Shadow shape:** seen edge-on at spin 0.998, the shadow runs from −2.11M to +7.00M, matching the circular photon orbits.
 - **Thin vs. wide inner ring:** the inner ring is drawn in Luminet's hand-inked style while it is thin. Near edge-on (88° and beyond) it becomes a broad arc, which is dotted like the rest of the disk (`ring_style`).
 - **How lopsided the ring is:** Luminet drew the ring lopsided. The fan is on the bright left only, and the line's dots thin out toward the right. That matches how unevenly the ring's brightness is spread when seen from his 80°. At other angles, the lopsidedness is scaled by the ring's actual brightness asymmetry relative to Luminet's view, squared (`ring_lopsided_power`). Seen face-on the ring is nearly even, so the fan wraps all the way around. At Luminet's own view it is drawn exactly as before.
 
@@ -57,7 +71,7 @@ This writes `luminet_animation.mp4`, a 60 fps video of the drawing being inked, 
 
 ### 1. Physics (from the paper)
 
-- **Light bending.** Photon paths around a non-spinning (Schwarzschild) black hole are integrated numerically for a range of impact parameters, using the orbit equation u″ = −u + 3Mu².
+- **Light bending.** Photon paths around a non-spinning (Schwarzschild) black hole are integrated numerically for a range of impact parameters, using the orbit equation u″ = −u + 3Mu². (Spinning holes use the Kerr tracer described under [Spin](#spin).)
 - **Geometry.** The observer sits 10° above the disk plane (80° from its axis), as in the paper's Fig. 11. Each pixel's ray is traced to where it crosses the disk, giving the **direct (primary)** image and the **secondary** image: light that went partway around the hole and forms the thin inner ring.
 - **Disk brightness.** The disk runs from the innermost stable orbit (6M) outward and glows according to the Page–Thorne formula (Eq. 15).
 - **Redshift.** Observed brightness is the intrinsic brightness divided by (1+z)⁴, where 1+z combines gravitational redshift and the Doppler shift from the disk's rotation (Eq. 19). This makes the approaching (left) side far brighter than the receding (right) side.
@@ -91,7 +105,8 @@ All settings are fields of `Params` in [`blackhole.py`](blackhole.py); `python b
 
 | Setting | What it controls |
 |---|---|
-| `inclination`, `r_in`, `r_out`, `approaching_side` | The black hole and disk being drawn |
+| `spin`, `inclination`, `r_in`, `r_out`, `approaching_side` | The black hole and disk being drawn |
+| `auto_exposure` | Brighten images whose bright region is too small to read |
 | `view`, `aspect` | Half-width of the frame (in units of the black hole's mass) and its width:height |
 | `dot_spacing` | Dot spacing in the brightest region (smaller = more dots overall) |
 | `dot_gamma` | Values above 1 thin the dim right and outer disk |

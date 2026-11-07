@@ -1,10 +1,14 @@
 """
-Stippled images of a non-spinning (Schwarzschild) black hole with a thin
-accretion disk, drawn the way J.-P. Luminet inked his 1979 image.
+Stippled images of a black hole with a thin accretion disk, drawn the way
+J.-P. Luminet inked his 1979 image.
 
 Physics:
-  1. Schwarzschild light bending (photon orbit eq. u'' = -u + 3Mu^2, M = 1)
-  2. Thin Keplerian disk with Page-Thorne bolometric flux
+  1. Light bending. Non-spinning (Schwarzschild): the photon orbit equation
+     u'' = -u + 3Mu^2, exactly as before. Spinning (Kerr): every pixel's ray is
+     traced back through the Kerr geometry, with its radial and polar motion
+     integrated in Mino time.
+  2. Thin disk on circular orbits, from the innermost stable orbit outward, with
+     the Page-Thorne (Novikov-Thorne, for spin) bolometric flux
   3. Gravitational + Doppler shift: F_obs = F / (1+z)^4
   4. Primary image + secondary ("ghost") image that wraps over the hole
   5. Rendered as dots, density ~ observed flux
@@ -39,11 +43,15 @@ def _p(default, help):
 class Params:
     # --- Black hole and disk ---
     inclination: float = _p(80.0, "observer's angle from the disk axis, in degrees (0 = face-on, 90 = edge-on)")
-    r_in: float = _p(6.0, "disk inner edge, in M (>= 6, the innermost stable orbit)")
+    spin: float = _p(0.0, "black hole spin a/M, from -0.998 to 0.998; positive spins the same way as the disk, "
+                          "negative against it (0 = Schwarzschild, as Luminet)")
+    r_in: float = _p(None, "disk inner edge, in M; default (isco) is the innermost stable orbit: 6M without spin, "
+                           "down to 1.24M (prograde) or up to 9M (retrograde)")
     r_out: float = _p(400.0, "disk outer edge, in M")
     approaching_side: str = _p('left', "side of the disk rotating toward the observer: 'left' or 'right'")
     sharp_inner_edge: bool = _p(True, "hold intrinsic brightness at its peak inside r_peak, so the disk starts abruptly at r_in, as Luminet drew it")
-    r_peak: float = _p(9.55, "radius of peak Page-Thorne brightness, in M (used by sharp_inner_edge)")
+    r_peak: float = _p(None, "radius of peak disk brightness, in M (used by sharp_inner_edge); default (auto) is "
+                             "9.55M without spin, as in Luminet's paper, else the computed peak")
     edge_softness: float = _p(0.4, "with sharp_inner_edge: how far into the disk the fade-in from the shadow lasts, in M")
     luminet_ghost: bool = _p(False, "draw the secondary image the way Luminet did (a thin line at ghost_b) instead of computing it")
     ghost_b: float = _p(5.25, "with luminet_ghost: impact parameter of the ghost line, in M")
@@ -59,6 +67,9 @@ class Params:
     banded: bool = _p(True, "ink more densely near a series of disk radii, like Luminet's isoradials")
     ring_step: float = _p(1.44, "with banded: each band's radius / the previous one's")
     band_depth: float = _p(0.10, "with banded: 0 = no banding, 1 = empty gaps between bands")
+    auto_exposure: bool = _p(True, "brighten the image until at least as much of the disk is inked at full density as in "
+                                   "Luminet's drawing (never darkens; matters for fast prograde spin, whose tiny, "
+                                   "extremely bright inner disk would otherwise leave the rest nearly blank)")
     dot_gamma: float = _p(1.3, ">1 thins dim regions more than bright ones")
     dot_gain: float = _p(2.2, ">1 pushes mid-bright regions toward saturation")
     dot_cap: float = _p(0.96, "density ceiling: how packed the brightest region is")
@@ -102,11 +113,25 @@ class Params:
     def view_h(self):
         return self.view / self.aspect
 
+    def resolved(self):
+        """A copy with the spin-dependent defaults (r_in, r_peak) filled in."""
+        r_in = isco(self.spin) if self.r_in is None else self.r_in
+        if self.r_peak is not None:
+            r_peak = self.r_peak
+        elif self.spin == 0:
+            r_peak = 9.55                      # Luminet's value: the Page-Thorne peak, to 3 figures
+        else:
+            r = np.linspace(isco(self.spin), 60.0, 200001)
+            r_peak = float(r[np.nanargmax(novikov_thorne(r, self.spin))])
+        return dataclasses.replace(self, r_in=r_in, r_peak=r_peak)
+
     def validate(self):
         if not 0 < self.inclination <= 90:
             raise ValueError("inclination must be in (0, 90] degrees")
-        if self.r_in < 6:
-            raise ValueError("r_in must be >= 6: no stable disk inside the innermost stable orbit")
+        if not -0.998 <= self.spin <= 0.998:
+            raise ValueError("spin must be in [-0.998, 0.998]")
+        if self.r_in < isco(self.spin) - 1e-9:
+            raise ValueError(f"r_in must be >= {isco(self.spin):.3f}: no stable disk inside the innermost stable orbit")
         if self.r_out <= self.r_in:
             raise ValueError("r_out must be larger than r_in")
         if self.approaching_side not in ('left', 'right'):
@@ -120,6 +145,9 @@ class Params:
 # Named starting points; each is a set of changes to the Luminet defaults.
 PRESETS = {
     'luminet1979': {},
+    'spinning': {'spin': 0.9},
+    'retrograde': {'spin': -0.9},
+    'max-spin-edge-on': {'spin': 0.998, 'inclination': 87.0, 'view': 30.0},
     # Seen face-on, Doppler beaming is weak; Luminet's contrast settings would
     # saturate the whole disk, so this preset spreads the brightness out.
     'face-on': {'inclination': 20.0, 'view': 30.0, 'dot_gain': 0.8, 'dot_gamma': 2.2, 'dot_cap': 0.8},
@@ -155,6 +183,95 @@ def trace_photons(p):
     return RegularGridInterpolator((phis, b_vals), U, bounds_error=False, fill_value=np.nan)
 
 
+def trace_kerr(p, X, Y, crossings=2, verbose=True, workers=None):
+    """Trace each image-plane point (X, Y), in M, back from a distant observer through
+    the Kerr geometry. Returns the radius of each ray's first `crossings` passes
+    through the disk plane (NaN where it falls in or escapes first), and whether it
+    fell into the hole. The rays are split across worker processes."""
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+    shape = X.shape
+    X, Y = X.ravel().astype(float), Y.ravel().astype(float)
+    workers = workers or max(1, min(8, (os.cpu_count() or 2) - 1))
+    if workers == 1 or len(X) < 50_000:
+        out, fell = _trace_kerr_rays(p.spin, p.inclination, X, Y, crossings)
+    else:
+        if verbose: print(f"  tracing {len(X)} rays through the Kerr geometry on {workers} processes...", flush=True)
+        chunks = np.array_split(np.arange(len(X)), workers * 4)
+        with ProcessPoolExecutor(workers) as ex:
+            parts = list(ex.map(_trace_kerr_rays, [p.spin] * len(chunks), [p.inclination] * len(chunks),
+                                [X[c] for c in chunks], [Y[c] for c in chunks], [crossings] * len(chunks)))
+        out = np.concatenate([o for o, _ in parts], axis=1)
+        fell = np.concatenate([f for _, f in parts])
+    return [o.reshape(shape) for o in out], fell.reshape(shape)
+
+
+def _trace_kerr_rays(a, inclination, X, Y, crossings):
+    """Kerr ray tracing for one batch of rays (see trace_kerr).
+
+    In Mino time lambda the radial and polar motions decouple. With x = 1/r and
+    u = cos(theta):
+        (dx/dl)^2 = P(x) = (1 + (a^2 - a ell) x^2)^2 - x^2 (1 - 2x + a^2 x^2) (eta + (ell - a)^2)
+        (du/dl)^2 = U(u) = eta + (a^2 - eta - ell^2) u^2 - a^2 u^4
+    where ell and eta (Carter's constant) follow from the image position. Both
+    are integrated in second-order form, x'' = P'(x)/2 and u'' = U'(u)/2, which
+    passes through turning points smoothly. With a = 0 this is u'' = -u + 3u^2."""
+    th = np.radians(min(inclination, 89.999))                # exactly edge-on, rays would start in the disk plane
+    ell = -X * np.sin(th)
+    eta = Y**2 + (X**2 - a*a) * np.cos(th)**2
+    A = a*a - a*ell
+    Q = eta + (ell - a)**2
+    C = a*a - eta - ell*ell
+    n = len(X)
+    out = np.full((crossings, n), np.nan)
+    # state, for the rays still being traced
+    idx = np.arange(n)
+    x = np.zeros(n); vx = np.ones(n)                         # x = 1/r = 0 at the observer, moving inward
+    u = np.full(n, np.cos(th)); vu = Y * np.sin(th)          # rays above the image center head toward the pole first
+    h = DPHI_KERR / np.maximum(np.sqrt(np.maximum(Q, 0)), 1.0)   # ~ constant step in orbital angle
+    hits = np.zeros(n, int)
+    fell = np.zeros(n, bool)
+    x_horizon = 1 / (1 + np.sqrt(1 - a*a))
+    def acc(x, u, A, Q, C):
+        return (2*A*x*(1 + A*x*x) - Q*x*(1 - 3*x + 2*a*a*x*x),  C*u - 2*a*a*u**3)
+    for step in range(MAX_STEPS_KERR):
+        if step % 20 == 0:                                   # drop finished rays
+            fell[idx[x >= x_horizon]] = True
+            live = (hits < crossings) & (x < x_horizon) & ~((x < 0) & (vx < 0))
+            if not live.all():
+                idx, x, vx, u, vu, h, A, Q, C, hits = (v[live] for v in (idx, x, vx, u, vu, h, A, Q, C, hits))
+            if len(idx) == 0:
+                break
+        # RK4 on (x, x', u, u')
+        k1x, k1u = acc(x, u, A, Q, C)
+        k2x, k2u = acc(x + 0.5*h*vx, u + 0.5*h*vu, A, Q, C)
+        x2v, u2v = vx + 0.5*h*k1x, vu + 0.5*h*k1u
+        k3x, k3u = acc(x + 0.5*h*x2v, u + 0.5*h*u2v, A, Q, C)
+        x3v, u3v = vx + 0.5*h*k2x, vu + 0.5*h*k2u
+        k4x, k4u = acc(x + h*x3v, u + h*u3v, A, Q, C)
+        x4v, u4v = vx + h*k3x, vu + h*k3u
+        x_new = x + h/6*(vx + 2*x2v + 2*x3v + x4v)
+        u_new = u + h/6*(vu + 2*u2v + 2*u3v + u4v)
+        vx = vx + h/6*(k1x + 2*k2x + 2*k3x + k4x)
+        vu = vu + h/6*(k1u + 2*k2u + 2*k3u + k4u)
+        # crossing the disk plane (u = 0) outside the horizon: interpolate x there
+        crossed = (u > 0) != (u_new > 0)
+        crossed &= (x > 0) & (x < x_horizon) & (hits < crossings)
+        if crossed.any():
+            i = np.nonzero(crossed)[0]
+            f = u[i] / (u[i] - u_new[i])
+            out[hits[i], idx[i]] = 1 / (x[i] + f * (x_new[i] - x[i]))
+            hits[i] += 1
+        x, u = x_new, u_new
+    fell[idx[x >= x_horizon]] = True
+    fell[idx[(hits < crossings) & (x > 0) & (x < x_horizon)]] = True   # still orbiting at the step limit
+    return out, fell
+
+
+DPHI_KERR = 0.01          # Kerr integration step, in radians of orbital angle (RK4)
+MAX_STEPS_KERR = 1400     # rays still orbiting after ~14 radians count as falling in
+
+
 # --- 2. Disk physics ------------------------------------------------------------
 def page_thorne(r):
     # Luminet's Eq. 15 prints sqrt(3)/3 on the log term; sqrt(3)/2 is the correct
@@ -166,8 +283,43 @@ def page_thorne(r):
         np.sqrt(x) - s6 + (s3/2) * np.log((np.sqrt(x)+s3)*(s6-s3) / ((np.sqrt(x)-s3)*(s6+s3))))
 
 
+def isco(a):
+    """Innermost stable circular orbit for spin a (a < 0: disk orbits against the spin)."""
+    z1 = 1 + (1 - a*a)**(1/3) * ((1 + a)**(1/3) + (1 - a)**(1/3))
+    z2 = np.sqrt(3*a*a + z1*z1)
+    return float(3 + z2 - np.sign(a) * np.sqrt((3 - z1) * (3 + z1 + 2*z2)))
+
+
+def novikov_thorne(r, a):
+    """Page-Thorne flux for spin a (Page & Thorne 1974, Eq. 15n). It reduces to
+    page_thorne() at a = 0, where it is numerically degenerate, so spin 0 uses that."""
+    x = np.sqrt(r / M); x0 = np.sqrt(isco(a))
+    t = np.arccos(a)
+    x1, x2, x3 = 2*np.cos((t - np.pi)/3), 2*np.cos((t + np.pi)/3), -2*np.cos(t/3)   # roots of x^3 - 3x + 2a
+    with np.errstate(divide='ignore', invalid='ignore'):
+        term = x - x0 - 1.5*a*np.log(x/x0)
+        for xi, xj, xk in ((x1, x2, x3), (x2, x1, x3), (x3, x1, x2)):
+            term = term - 3*(xi - a)**2 / (xi*(xi - xj)*(xi - xk)) * np.log((x - xi) / (x0 - xi))
+        return (3*M/(8*np.pi)) / (x**4 * (x**3 - 3*x + 2*a)) * term
+
+
+def one_plus_z_kerr(r, ell, a):
+    """Redshift of light with angular momentum ell (per unit energy) from a circular
+    equatorial orbit at r: 1+z = u^t (1 - Omega ell)."""
+    om = 1 / (r**1.5 + a)                                      # Keplerian angular velocity
+    ut = 1 / np.sqrt(1 - 2/r + 4*a*om/r - (r*r + a*a + 2*a*a/r) * om*om)
+    return ut * (1 - om * ell)
+
+
 def observed_flux(p, r, b, alpha):
     incl = np.radians(p.inclination)
+    if p.spin != 0:
+        ell = -b * np.sin(alpha) * np.sin(incl)              # image x = b sin(alpha); ell = -x sin(incl)
+        one_plus_z = one_plus_z_kerr(r, ell, p.spin)
+        if p.sharp_inner_edge:
+            fade = 1 - np.exp(-np.maximum(r - p.r_in, 0) / p.edge_softness)
+            return fade * novikov_thorne(np.maximum(r, p.r_peak), p.spin) / one_plus_z**4
+        return novikov_thorne(r, p.spin) / one_plus_z**4
     one_plus_z = (1 + np.sqrt(M / r**3) * b * np.sin(incl) * np.sin(alpha)) / np.sqrt(1 - 3*M/r)
     if p.sharp_inner_edge:
         # Luminet's drawing goes from dark shadow to dense dots abruptly, while
@@ -196,11 +348,16 @@ def disk_image(p, interp):
     RMAP = np.full_like(B, np.nan)   # disk radius seen at each cell
     # Secondary image. Luminet did not compute it fully: he drew it as a thin line at
     # b = 5.25M and overestimated its brightness with r = 9.55M, b = 5.25M in Eqs. 15 & 19.
+    if p.spin != 0:
+        r_kerr, _ = trace_kerr(p, X, Y)
     for n in ((0,) if p.luminet_ghost else (1, 0)):   # secondary first, primary overwrites (opaque disk)
-        phi = gamma + n * np.pi
-        un = interp(np.stack([phi.ravel(), B.ravel()], -1)).reshape(B.shape)
         with np.errstate(divide='ignore', invalid='ignore'):
-            r = 1.0 / un
+            if p.spin != 0:
+                r = r_kerr[n]
+            else:
+                phi = gamma + n * np.pi
+                un = interp(np.stack([phi.ravel(), B.ravel()], -1)).reshape(B.shape)
+                r = 1.0 / un
             hit = (r >= p.r_in) & (r <= p.r_out)
             F = np.where(hit, observed_flux(p, np.where(hit, r, 10), B, ALPHA), 0)
         flux = np.where(hit, F, flux)
@@ -219,6 +376,9 @@ def disk_image(p, interp):
 # The secondary ring's brightness asymmetry as seen in the 1979 view (80 degrees),
 # slightly rounded down so that view always counts as fully lopsided.
 LUMINET_RING_ASYMMETRY = 0.411        # measured: 0.41187
+# Fraction of the disk inked at full density in the 1979 view, slightly rounded
+# down so that auto_exposure leaves that view exactly as it is.
+LUMINET_SATURATED_FRACTION = 0.0105   # measured: 0.010617
 
 
 def ring_asymmetry(ca, fb):
@@ -257,7 +417,17 @@ def stipple(p, img, verbose=True):
         k = np.log(RMAP / p.r_in) / np.log(p.ring_step)          # fractional ring index
         ring = 1 + p.band_depth * np.cos(2 * np.pi * np.nan_to_num(k))   # peaks on each ring
         weight = np.where(np.isnan(RMAP), 1.0, ring)
-    disk_density = np.minimum(p.dot_gain * np.nan_to_num((flux / np.nanmax(flux)) ** p.dot_gamma), p.dot_cap) * weight
+    # Brightness reference: the brightest point, as Luminet did, unless that would
+    # leave less of the disk at full density than in his drawing (auto_exposure).
+    ref = np.nanmax(flux)
+    disk_flux = flux[~np.isnan(RMAP)]
+    if p.auto_exposure and disk_flux.size:
+        full = (p.dot_cap / p.dot_gain) ** (1 / p.dot_gamma)        # brightness, relative to ref, that reaches dot_cap
+        ref_auto = np.quantile(disk_flux, 1 - LUMINET_SATURATED_FRACTION) / full
+        if ref_auto < ref:
+            if verbose: print(f"auto exposure: brightened {ref / ref_auto:.1f}x")
+            ref = ref_auto
+    disk_density = np.minimum(p.dot_gain * np.nan_to_num((flux / ref) ** p.dot_gamma), p.dot_cap) * weight
     disk_density = np.where(SEC, 0.0, disk_density)   # the ring band is inked separately, in rows
     density = disk_density + np.where(np.isnan(RMAP), 0.0, p.background_density)   # on the disk only, none in the hole
 
@@ -447,9 +617,9 @@ class Drawing:
 
 def make_drawing(p=None, verbose=True):
     """Trace light, compute the disk's brightness and place every ink dot."""
-    p = p or Params()
+    p = (p or Params()).resolved()
     p.validate()
-    img = disk_image(p, trace_photons(p))
+    img = disk_image(p, trace_photons(p) if p.spin == 0 else None)
     dots, rng = stipple(p, img, verbose)
     # Blobby ink dots: each dot is a main blob plus a small offset lobe, with
     # size varying from dot to dot.
@@ -561,6 +731,8 @@ def _convert(name, value):
     if kind in ('bool', bool):
         if isinstance(value, bool): return value
         return str(value).lower() in ('1', 'true', 'yes', 'on')
+    if name in ('r_in', 'r_peak') and (value is None or str(value).lower() in ('isco', 'auto', 'none', '')):
+        return None                                   # use the spin-dependent default
     return {'float': float, 'int': int, 'str': str}.get(kind, kind)(value)
 
 

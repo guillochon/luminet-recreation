@@ -272,7 +272,7 @@ def main():
     print(f"Rendering {len(d.dots)} dots at {W}x{H}, {args.fps} fps")
 
     print("Ordering dots...")
-    order = drawing_order(d.dots, p)
+    order = drawing_order(d.dots, d.p)                    # d.p has the spin-dependent defaults filled in
     print("Making ink stamps...")
     geom = drop_geometry(d, H, W, dpi)
     geom = {k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in geom.items()}
