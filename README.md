@@ -34,7 +34,8 @@ The order is: `--preset` (default `luminet1979`), then `--params`, then each `--
 - **Style:** dot density and contrast, isoradial banding, the hand-drawn inner ring, dot size and shape, colors, and paper texture.
 - **Presets:** `luminet1979`, `face-on`, `edge-on`, `truncated-disk` (r_in = 14M) and `luminet-ghost`.
 - **Physics limits:** the black hole doesn't spin (Schwarzschild), and the disk is thin and glows by the Page–Thorne formula.
-- **Thin vs. wide inner ring:** the inner ring is drawn in Luminet's hand-inked style while it is thin. Near edge-on it becomes a broad arc, which is dotted like the rest of the disk (`ring_style`).
+- **Thin vs. wide inner ring:** the inner ring is drawn in Luminet's hand-inked style while it is thin. Near edge-on (88° and beyond) it becomes a broad arc, which is dotted like the rest of the disk (`ring_style`).
+- **How lopsided the ring is:** Luminet drew the ring lopsided. The fan is on the bright left only, and the line's dots thin out toward the right. That matches how unevenly the ring's brightness is spread when seen from his 80°. At other angles, the lopsidedness is scaled by the ring's actual brightness asymmetry relative to Luminet's view, squared (`ring_lopsided_power`). Seen face-on the ring is nearly even, so the fan wraps all the way around. At Luminet's own view it is drawn exactly as before.
 
 The animation takes the same options: `python luminet_animation.py --preset edge-on`.
 

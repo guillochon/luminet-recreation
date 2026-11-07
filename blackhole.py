@@ -71,6 +71,9 @@ class Params:
     ring_style: str = _p('auto', "secondary image: 'line' (Luminet's dotted line + fan), 'stipple' (dotted like the disk), "
                                  "or 'auto' (line unless the image is wider than ring_line_max_width, as when edge-on)")
     ring_line_max_width: float = _p(2.0, "with ring_style='auto': widest secondary image still drawn as a line, in M")
+    ring_lopsided_power: float = _p(2.0, "Luminet's lopsided ring (fan on the bright side only, line spacing growing toward "
+                                         "the dim side) is scaled by (ring's brightness asymmetry / Luminet's) ** this; "
+                                         "0 = always fully lopsided")
     ring_spacing_bright: float = _p(0.17, "line dot spacing at the bright end, in M per 30 M of view")
     ring_spacing_dim: float = _p(0.34, "line dot spacing at the dim end, in M per 30 M of view")
     ring_second_row: int = _p(4, "dots in a short second row at the dim end")
@@ -213,6 +216,20 @@ def disk_image(p, interp):
 
 
 # --- 4. Stipple it, like Luminet's India-ink dots ------------------------------------
+# The secondary ring's brightness asymmetry as seen in the 1979 view (80 degrees),
+# slightly rounded down so that view always counts as fully lopsided.
+LUMINET_RING_ASYMMETRY = 0.411        # measured: 0.41187
+
+
+def ring_asymmetry(ca, fb):
+    """(bright left - dim right) / (sum) of the ring's mean brightness."""
+    left = np.sin(ca) < 0
+    if not left.any() or left.all():
+        return 0.0
+    l, r = fb[left].mean(), fb[~left].mean()
+    return (l - r) / (l + r)
+
+
 def stipple(p, img, verbose=True):
     from skimage import measure
     VIEW, VIEW_H = p.view, p.view_h
@@ -338,7 +355,25 @@ def stipple(p, img, verbose=True):
         weight_w = (bmax - bmin) * fb
         w_rel = np.clip((weight_w / max(weight_w.max(), 1e-300) - p.fan_threshold) / (1 - p.fan_threshold), 0, 1)
         fan_w = FAN_MAX_WIDTH * w_rel ** p.fan_taper
-        fan_w = np.where(np.sin(ca) < 0, fan_w, 0.0)      # fan only on the left; the right stays a clean single line
+        # Luminet drew the ring lopsided: fan on the bright left only, line dots
+        # thinning toward the right. That matches the ring's Doppler asymmetry seen
+        # from his 80 degrees. Elsewhere, scale the lopsidedness by how asymmetric
+        # the ring really is; at or above Luminet's asymmetry, draw it exactly his way.
+        left = np.sin(ca) < 0
+        asym = ring_asymmetry(ca, fb)
+        lop =min(1.0, max(asym, 0.0) / LUMINET_RING_ASYMMETRY) ** p.ring_lopsided_power
+        if lop >= 1.0:
+            fan_w = np.where(left, fan_w, 0.0)            # fan only on the left; the right stays a clean single line
+        else:
+            # fade the fan out across the top and bottom instead of cutting it at 12 and 6 o'clock,
+            # and keep (1 - lop) of it on the dim side
+            to_left = np.clip(0.5 - np.sin(ca) / 0.6, 0, 1)
+            fan_w = fan_w * (lop * to_left + (1 - lop))
+            mid = 0.5 * (RING_SPACING_LEFT + RING_SPACING_RIGHT)
+            RING_SPACING_LEFT = mid + (RING_SPACING_LEFT - mid) * lop
+            RING_SPACING_RIGHT = mid + (RING_SPACING_RIGHT - mid) * lop
+            RIGHT_FAN_DOTS = int(round(RIGHT_FAN_DOTS * lop))
+        if verbose and lop < 1.0: print(f"ring asymmetry {asym:.3f} -> lopsidedness {lop:.2f}")
         gapped = np.concatenate([[False], np.diff(ca) > np.radians(3)])
         contiguous = ~(gapped | np.roll(gapped, -1))       # break on both sides of a gap
         # 1) the carefully dotted inner line
