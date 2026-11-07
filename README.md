@@ -15,6 +15,29 @@ python luminet_1979.py
 
 This writes `luminet_recreation.png` (5600 × 2800 px by default) to the current directory. It may take a minute or two.
 
+### Other black holes
+
+The rendering engine is [`blackhole.py`](blackhole.py). Every setting, physical or stylistic, is a field of its `Params` class, and the defaults are exactly Luminet's. `luminet_1979.py` just renders those defaults, so the recreation is always reproducible. To draw something else, change parameters:
+
+```bash
+python blackhole.py --list-params                          # every parameter, its default and meaning
+python blackhole.py --set inclination=60 --out tilted.png
+python blackhole.py --preset face-on
+python blackhole.py --set inclination=50 --set approaching_side=right --set r_out=30 --set view=40
+python blackhole.py --params my_hole.json                  # a JSON file of parameter values
+```
+
+The order is: `--preset` (default `luminet1979`), then `--params`, then each `--set`. Next to the image, `blackhole.py` saves a `.json` file with every value used, so you can pass it back with `--params` to reproduce the image.
+
+- **Black hole and disk:** viewing angle (`inclination`, 0° face-on to 90° edge-on), disk inner and outer edge (`r_in` ≥ 6M, `r_out`), which side rotates toward you (`approaching_side`), the sharp inner edge, and Luminet's approximate ghost ring (`luminet_ghost`).
+- **Frame:** zoom (`view`, the half-width in units of M) and shape (`aspect`). The black hole's mass only sets the length unit, so it isn't a parameter.
+- **Style:** dot density and contrast, isoradial banding, the hand-drawn inner ring, dot size and shape, colors, and paper texture.
+- **Presets:** `luminet1979`, `face-on`, `edge-on`, `truncated-disk` (r_in = 14M) and `luminet-ghost`.
+- **Physics limits:** the black hole doesn't spin (Schwarzschild), and the disk is thin and glows by the Page–Thorne formula.
+- **Thin vs. wide inner ring:** the inner ring is drawn in Luminet's hand-inked style while it is thin. Near edge-on it becomes a broad arc, which is dotted like the rest of the disk (`ring_style`).
+
+The animation takes the same options: `python luminet_animation.py --preset edge-on`.
+
 ### Animation
 
 ```bash
@@ -25,7 +48,6 @@ This writes `luminet_animation.mp4`, a 60 fps video of the drawing being inked, 
 
 - **Drying ink.** Each drop lands wet: about 15% smaller than its final size and domed like a droplet, lit from the upper left with a small glint. Over 5 seconds it flattens and spreads to its final size. When it's dry it is exactly the dot in the still.
 - **Lighter paper texture.** The video uses the paper grain and tone variation at half the still's strength (`--texture 0.5`). Use `--texture 1` to match the still.
-
 - **Drawing order.** Dots go down from the inside out, along a short pen path. The drawing is split into thin bands, each about two dot spacings wide. Near the hole the bands are circles; farther out they stretch to the frame's 2:1 shape. The pen sweeps around each band, alternating direction, so every band starts where the previous one ended. A traveling-salesman improvement step (2-opt) then shortens the route. The typical hop between consecutive dots is 0.15 M, close to the 0.12 M spacing between neighboring dots.
 - **Same image as the still.** Each frame is built the same way as the still: same dots, same blur, same paper texture. With `--texture 1`, the last frame matches a half-resolution render of the still.
 - **Video compression.** Thousands of tiny dots on grainy paper are hard for a video encoder. Three settings deal with that. First, the paper texture stays fixed from frame to frame, so each frame differs from the last only around the drops that are still drying, which keeps the video small. Second, the H.264 encoder runs at high quality (CRF 12) with `-tune grain`, so it doesn't smooth away the grain or the dot edges. Third, the file uses an explicit, tagged BT.709 color conversion, so players don't shift the colors. Use `--lossless` for an exact RGB master (`.mkv`) to re-encode from, or `--pix-fmt yuv444p` for full color resolution.
@@ -55,34 +77,39 @@ Some choices follow the paper; others were tuned by eye to match the original dr
 
 | Faithful to the paper | Tuned to match the drawing |
 |---|---|
-| Viewing angle, disk inner edge, light bending | How brightness maps to dot density (`DOT_GAMMA`, `DOT_GAIN`, `DOT_CAP`) |
-| Page–Thorne brightness (with the √3/2 correction) | Sharp inner disk edge (`SHARP_INNER_EDGE`), which departs from strict physics |
+| Viewing angle, disk inner edge, light bending | How brightness maps to dot density (`dot_gamma`, `dot_gain`, `dot_cap`) |
+| Page–Thorne brightness (with the √3/2 correction) | Sharp inner disk edge (`sharp_inner_edge`), which departs from strict physics |
 | Gravitational + Doppler redshift, (1+z)⁴ dimming | The inner ring's dot spacing and fan shapes |
 | Primary and secondary images, opaque disk | Background speckle, banding, paper texture, dot size |
 
-The paper says Luminet estimated the inner ring's brightness with fixed values (r = 9.55M, b = 5.25M) rather than computing it. Setting `LUMINET_GHOST = True` uses that approximation; the default draws the fully computed ring.
+The paper says Luminet estimated the inner ring's brightness with fixed values (r = 9.55M, b = 5.25M) rather than computing it. `--set luminet_ghost=true` (or `--preset luminet-ghost`) uses that approximation; the default draws the fully computed ring.
 
 ## Main settings
 
-All settings are constants near where they're used in `luminet_1979.py`.
+All settings are fields of `Params` in [`blackhole.py`](blackhole.py); `python blackhole.py --list-params` prints them all. The ones most worth knowing:
 
 | Setting | What it controls |
 |---|---|
-| `VIEW` | Half-width of the frame, in units of the black hole's mass |
-| `RES_SCALE` | Output resolution multiplier; blur and texture scale with it |
-| `SPACING_AT_PEAK` | Dot spacing in the brightest region (smaller = more dots overall) |
-| `DOT_GAMMA` | Values above 1 thin the dim right and outer disk |
-| `DOT_GAIN` | Pushes mid-bright regions toward full density (the white "claw") |
-| `DOT_CAP` | How packed the brightest, saturated region is |
-| `BACKGROUND_DENSITY` | Faint speckle in the darkest areas |
-| `EDGE_SOFTNESS` | How quickly the disk fades in from the shadow edge |
-| `EDGE_ROWS` | Rows of regular dots along the shadow edge before random placement |
-| `RING_SPACING_LEFT`, `RING_SPACING_RIGHT` | Inner-ring dot spacing at each end |
-| `FAN_MAX_WIDTH`, `FAN_TAPER`, `FAN_THRESHOLD`, `FAN_SPACING`, `FAN_INSIDE` | Shape and density of the left fan |
-| `RIGHT_FAN_DOTS` | Length of the two-dot stretch on the right |
-| `RING_STEP`, `BAND_DEPTH` | Spacing and strength of isoradial banding |
-| `BASE`, `INK_BLUR` | Dot size and edge softness |
-| `TEXTURE`, `GRAIN`, `MOTTLE`, `DRIFT`, `EDGE_ROUGHNESS` | Paper and photographic texture |
+| `inclination`, `r_in`, `r_out`, `approaching_side` | The black hole and disk being drawn |
+| `view`, `aspect` | Half-width of the frame (in units of the black hole's mass) and its width:height |
+| `dot_spacing` | Dot spacing in the brightest region (smaller = more dots overall) |
+| `dot_gamma` | Values above 1 thin the dim right and outer disk |
+| `dot_gain` | Pushes mid-bright regions toward full density (the white "claw") |
+| `dot_cap` | How packed the brightest, saturated region is |
+| `background_density` | Faint speckle in the darkest areas |
+| `edge_softness` | How quickly the disk fades in from the shadow edge |
+| `edge_rows` | Rows of regular dots along the shadow edge before random placement |
+| `ring_style` | The inner ring as Luminet's dotted line and fan, or dotted like the disk |
+| `ring_spacing_bright`, `ring_spacing_dim` | Inner-ring dot spacing at each end |
+| `fan_max_width`, `fan_taper`, `fan_threshold`, `fan_spacing`, `fan_inside` | Shape and density of the fan on the bright side |
+| `ring_second_row` | Length of the two-dot stretch at the dim end |
+| `ring_step`, `band_depth` | Spacing and strength of isoradial banding |
+| `dot_size`, `ink_blur` | Dot size and edge softness |
+| `paper`, `ink` | Colors |
+| `texture`, `grain`, `mottle`, `drift`, `edge_roughness` | Paper and photographic texture |
+| `seed` | Random seed for dot placement |
+
+The output resolution is a render option, not a parameter: `--res-scale` for `blackhole.py` (1 = 2800 px wide).
 
 ## References
 

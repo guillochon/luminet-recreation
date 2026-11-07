@@ -31,6 +31,8 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+import blackhole as bh
+
 
 def lower_priority():
     """Run at below-normal CPU priority; ffmpeg inherits it."""
@@ -44,21 +46,21 @@ def lower_priority():
 
 
 # --- Drawing order ---------------------------------------------------------
-ROUND_UNTIL = 6.0        # contours are circles out to this radius (in M)...
-FRAME_ASPECT = 2.0       # ...then stretch to the frame's width:height ratio
 BAND_WIDTH = 2.0         # contour band width, in local dot spacings
 TWO_OPT_WINDOW = 60      # how far ahead (in dots) 2-opt looks for a better link
 
 
-def contour_radius(x, y, half_height):
+def contour_radius(x, y, half_height, aspect, round_until):
     """Label each point with the contour it sits on. A contour of radius rho is an
-    ellipse with half-height rho and half-width a(rho): a circle up to ROUND_UNTIL,
-    widening to FRAME_ASPECT * rho by the time it reaches the frame's top edge."""
+    ellipse with half-height rho and half-width a(rho): a circle out to round_until,
+    then stretching to the frame's aspect ratio by the time it reaches the frame's
+    top edge."""
+    round_until = min(round_until, 0.5 * half_height)
     def a(rho):
-        t = np.clip((rho - ROUND_UNTIL) / (half_height - ROUND_UNTIL), 0, 1)
-        return rho * (1 + t * (FRAME_ASPECT - 1))
+        t = np.clip((rho - round_until) / (half_height - round_until), 0, 1)
+        return rho * (1 + t * (aspect - 1))
     r = np.hypot(x, y)
-    lo, hi = r / FRAME_ASPECT, r.copy()          # the contour radius always lies in between
+    lo, hi = r / max(aspect, 1), r / min(aspect, 1)   # the contour radius always lies in between
     for _ in range(50):                          # bisection: x^2/a^2 + y^2/rho^2 = 1
         mid = 0.5 * (lo + hi)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -95,9 +97,9 @@ def two_opt(P, order, window, max_passes=20):
     return order
 
 
-def drawing_order(P, half_height):
+def drawing_order(P, p):
     x, y = P.T
-    rho = contour_radius(x, y, half_height)
+    rho = contour_radius(x, y, p.view_h, p.aspect, p.r_in)   # circles out to the disk's inner edge
     theta = np.arctan2(y, x)
     # local dot spacing as a function of contour radius, so bands are a fixed
     # number of dot spacings wide in both the dense and the sparse parts
@@ -135,13 +137,14 @@ DIFFUSE = 0.55           # how strongly the dome's slope lightens / darkens the 
 GLINT, GLINT_POWER = 0.45, 14   # specular highlight strength and tightness
 
 
-def drop_geometry(L, H, W, dpi):
+def drop_geometry(d, H, W, dpi):
     """Pixel positions and radii of every dot and its lobe, and the stamp grid."""
     px_pt = dpi / 72
     def to_px(xy):
-        return (L.VIEW / 2 - xy[:, 1]) / L.VIEW * H, (xy[:, 0] + L.VIEW) / (2 * L.VIEW) * W
-    cy, cx = to_px(L.dots); ly, lx = to_px(L.lobe)
-    r_dot = 0.5 * L.size * px_pt; r_lobe = 0.5 * L.LOBE_SCALE * L.size * px_pt
+        return (p.view_h - xy[:, 1]) / (2 * p.view_h) * H, (xy[:, 0] + p.view) / (2 * p.view) * W
+    p = d.p
+    cy, cx = to_px(d.dots); ly, lx = to_px(d.lobe)
+    r_dot = 0.5 * d.size * px_pt; r_lobe = 0.5 * p.lobe_scale * d.size * px_pt
     K = int(np.ceil(2 * (r_dot.max() + np.hypot(cy - ly, cx - lx).max()))) + 3
     r0 = np.floor(cy - K / 2).astype(int) + 1; c0 = np.floor(cx - K / 2).astype(int) + 1
     return dict(cy=cy, cx=cx, ly=ly, lx=lx, r_dot=r_dot, r_lobe=r_lobe, r0=r0, c0=c0, K=K)
@@ -223,8 +226,9 @@ def ffmpeg_command(out, W, H, fps, args):
         #     don't shift the colors;
         #   - 4:2:0 chroma, which is safe here because the image is nearly gray;
         #     pass --pix-fmt yuv444p for full color resolution (less compatible).
-        cmd += ['-vf', 'scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd',
-                '-c:v', 'libx264', '-preset', args.preset, '-crf', str(args.crf), '-tune', 'grain',
+        cmd += ['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2,'    # 4:2:0 needs even dimensions
+                       'scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd',
+                '-c:v', 'libx264', '-preset', args.x264_preset, '-crf', str(args.crf), '-tune', 'grain',
                 '-pix_fmt', args.pix_fmt, '-g', str(10 * fps),
                 '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
                 '-color_range', 'tv', '-movflags', '+faststart']
@@ -238,7 +242,8 @@ def smoothstep(t):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--out', default=None, help='output file (default luminet_animation.mp4, or .mkv with --lossless)')
+    ap.add_argument('--out', default=None, help='output file (default luminet_animation.mp4, or blackhole_animation.mp4 '
+                                                'for other parameters; .mkv with --lossless)')
     ap.add_argument('--fps', type=int, default=60)
     ap.add_argument('--dots-per-frame', type=float, default=3.0, help='dots added per frame')
     ap.add_argument('--dry-seconds', type=float, default=5.0, help='how long each drop takes to dry')
@@ -248,32 +253,35 @@ def main():
     ap.add_argument('--hold-end', type=float, default=4.0, help='seconds to hold the finished, dry drawing')
     ap.add_argument('--seconds', type=float, default=None, help='stop after this many seconds (for previews)')
     ap.add_argument('--crf', type=float, default=12, help='x264 quality: lower is better and bigger')
-    ap.add_argument('--preset', default='slow', help='x264 speed/efficiency preset')
+    ap.add_argument('--x264-preset', default='slow', help='x264 speed/efficiency preset')
     ap.add_argument('--pix-fmt', default='yuv420p', help='yuv420p (plays everywhere) or yuv444p')
     ap.add_argument('--lossless', action='store_true', help='lossless RGB H.264 master in .mkv')
     ap.add_argument('--last-frame', default=None, help='also save the final frame as this PNG')
+    bh.add_param_args(ap)
     args = ap.parse_args()
-    out = args.out or ('luminet_animation.mkv' if args.lossless else 'luminet_animation.mp4')
+    p = bh.params_from_args(args)
+    name = 'luminet_animation' if p == bh.Params() else 'blackhole_animation'
+    out = args.out or (name + ('.mkv' if args.lossless else '.mp4'))
     lower_priority()
 
     print("Placing dots (same as the still)...")
-    import luminet_1979 as L
-    RES = L.RES_SCALE / 2                                 # half the still's DPI
+    d = bh.make_drawing(p)
+    RES = 1                                               # half the still's default DPI
     dpi = 200 * RES
-    W, H = round(L.FIG_W * dpi), round(L.FIG_H * dpi)
-    print(f"Rendering {len(L.dots)} dots at {W}x{H}, {args.fps} fps")
+    W, H = d.pixels(RES)
+    print(f"Rendering {len(d.dots)} dots at {W}x{H}, {args.fps} fps")
 
     print("Ordering dots...")
-    order = drawing_order(L.dots, L.VIEW / 2)
+    order = drawing_order(d.dots, p)
     print("Making ink stamps...")
-    geom = drop_geometry(L, H, W, dpi)
+    geom = drop_geometry(d, H, W, dpi)
     geom = {k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in geom.items()}
     stamps = Stamps(geom)
     dry, A, G, SP = stamps.dry, stamps.A, stamps.G, stamps.SP
     r0, c0, K = geom['r0'], geom['c0'], geom['K']
 
-    tex = L.Texturer(H, W, RES, strength=args.texture)
-    blur_sigma = L.INK_BLUR * RES
+    tex = bh.Texturer(H, W, RES, p, strength=args.texture)
+    blur_sigma = p.ink_blur * RES
     reach = int(np.ceil(4 * blur_sigma))                  # gaussian_filter's kernel radius
     P = K + 1                                             # padding so stamps never fall off the arrays
     Hp, Wp = H + 2 * P, W + 2 * P
