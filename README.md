@@ -67,6 +67,22 @@ This writes `luminet_animation.mp4`, a 60 fps video of the drawing being inked, 
 - **Same image as the still.** Each frame is built the same way as the still: same dots, same blur, same paper texture. With `--texture 1`, the last frame matches a half-resolution render of the still.
 - **Video compression.** Thousands of tiny dots on grainy paper are hard for a video encoder. Three settings deal with that. First, the paper texture stays fixed from frame to frame, so each frame differs from the last only around the drops that are still drying, which keeps the video small. Second, the H.264 encoder runs at high quality (CRF 12) with `-tune grain`, so it doesn't smooth away the grain or the dot edges. Third, the file uses an explicit, tagged BT.709 color conversion, so players don't shift the colors. Use `--lossless` for an exact RGB master (`.mkv`) to re-encode from, or `--pix-fmt yuv444p` for full color resolution.
 
+### Fly-by
+
+```bash
+python flyby.py --set spin=0.998
+```
+
+This writes `flyby.mp4`: a 24-second, 60 fps video in which the camera flies past the black hole. It takes the same black hole options as the stills (`--preset`, `--set`, `--params`), and runs at about 5 seconds per frame, so the full video takes around 2 hours.
+
+- **The orbit.** The camera falls in from 80M on a real parabolic orbit (energy exactly 1) whose plane is tilted 45° to the disk. Its closest approach is 10M, where it is also highest above the disk. It passes through the disk plane twice, at about 16M, briefly seeing the disk exactly edge-on. Options: `--periapsis`, `--orbit-tilt`, `--retrograde-orbit`, `--start-radius`.
+- **What the camera sees.** Each frame is ray traced from the camera's actual position and velocity. That includes light bending and the spinning hole's geometry, plus aberration and Doppler shift from the camera's own motion, up to 0.43c at closest approach. The camera always points at the hole, with a 60° field of view (`--fov`).
+- **Pacing.** In the camera's own time, the close encounter is brief. Each frame advances the camera's clock in proportion to its distance (`--pacing 1`), so the encounter fills about 9 of the 24 seconds. `--pacing 0` runs the clock evenly.
+- **Dots that stay on the disk.** Each ink dot is a point on the disk that orbits with the gas, so the dots move smoothly as the disk turns and the view changes (`--disk-rotation` speeds this up or slows it down). Each frame, a dot that ends up crowded by an older one fades out, and gaps are filled with new dots that fade in. This keeps the dot spacing following the brightness, as in the stills. About 97% of dots carry over from one frame to the next, even at closest approach. One simplification: the dots ignore the light-travel delays between different parts of the disk. With those delays, near the hole the same parcel of gas can appear twice. The brightness, lensing and redshift keep the full physics.
+- **Exposure.** Auto exposure is measured over the whole flight and smoothed over half a second, like a camera's, so the brightness doesn't flicker.
+- **Checks.** A motionless camera placed far away reproduces the stills' ray tracer. Over the whole orbit, the camera's 4-velocity stays normalized to 1 within 10⁻⁷.
+- **Previews.** `--frames 0.5` saves single frames as PNGs, at fractions of the flight (0.5 is closest approach). `--range 0.45 0.55` renders only part of the flight.
+
 ## How it works
 
 ### 1. Physics (from the paper)
