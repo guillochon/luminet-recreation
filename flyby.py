@@ -166,63 +166,78 @@ def camera_rays(a, cam, v, X, Y, fov_deg):
 # --- Ray tracing (runs in worker processes) ----------------------------------------
 def trace_rays(a, x0, u0, vx, vu, ell, eta, crossings=2):
     """Trace backward rays from the camera; for each of the first `crossings` passes
-    through the disk plane return r there and how much the photon's phi and t
+    through the disk plane return r there and how much the photon's phi (modulo 2 pi) and t
     advanced between there and the camera. Same Mino-time scheme as
     blackhole._trace_kerr_rays, which starts from a distant observer instead."""
     n = len(ell)
     A = a*a - a*ell
     Q = eta + (ell - a)**2
-    C = a*a - eta - ell*ell
     out = np.full((3, crossings, n), np.nan)            # r, delta phi, delta t
     idx = np.arange(n)
-    x = np.full(n, x0); u = np.full(n, u0); vx = vx.copy(); vu = vu.copy()
+    x = np.full(n, x0); vx = vx.copy()
+    # The angular motion (theta, and the l / sin^2 theta part of phi) is tracked as a
+    # point N = (sin th cos ph, sin th sin ph, cos th) moving on the unit sphere:
+    # in Mino time it obeys N'' = a^2 u z - (a^2 u^2 + |N'|^2) N with u = N_z, which,
+    # unlike dphi/dlambda = l / (1 - u^2), has no singularity at the poles. (Rays that
+    # pass close to a pole otherwise get a wrong phi, in a thin line on screen.)
+    s0 = np.sqrt(1 - u0*u0)
+    N = np.zeros((n, 3)); N[:, 0] = s0; N[:, 2] = u0
+    V = np.zeros((n, 3)); V[:, 0] = -u0*vu/s0; V[:, 1] = -ell/s0; V[:, 2] = vu   # backward ray: phi runs backward
     Ip = np.zeros(n); It = np.zeros(n)
     h = DPHI / np.maximum(np.sqrt(np.maximum(Q, 0)), 1.0)
     hits = np.zeros(n, int)
     x_h = 1 / (1 + np.sqrt(1 - a*a))
-    def acc(x, u, A, Q, C):
-        return 2*A*x*(1 + A*x*x) - Q*x*(1 - 3*x + 2*a*a*x*x), C*u - 2*a*a*u**3
-    def rates(x, u, A, ell):
-        s2 = np.maximum(1 - u*u, 1e-12)
+    def acc(x, N, V, A, Q):
+        u = N[:, 2]
+        aN = -(a*a*u*u + (V*V).sum(1))[:, None] * N
+        aN[:, 2] += a*a*u
+        return 2*A*x*(1 + A*x*x) - Q*x*(1 - 3*x + 2*a*a*x*x), aN
+    def rates(x, u, A, ell):                            # the regular parts of dphi/dlambda and dt/dlambda
+        s2 = 1 - u*u
         D = 1 - 2*x + a*a*x*x
         B = 1 + A*x*x
-        return ell/s2 - a + a*B/D, -a*(a*s2 - ell) + (1 + a*a*x*x)*B/(x*x*D)
+        return -a + a*B/D, -a*(a*s2 - ell) + (1 + a*a*x*x)*B/(x*x*D)
     with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
         for step in range(MAX_STEPS):
             if step % 20 == 0:
                 live = (hits < crossings) & (x < x_h) & ~((x < 0) & (vx < 0))
                 if not live.all():
-                    idx, x, vx, u, vu, h, A, Q, C, hits, Ip, It, ell = (
-                        w[live] for w in (idx, x, vx, u, vu, h, A, Q, C, hits, Ip, It, ell))
+                    idx, x, vx, N, V, h, A, Q, hits, Ip, It, ell = (
+                        w[live] for w in (idx, x, vx, N, V, h, A, Q, hits, Ip, It, ell))
                 if len(idx) == 0:
                     break
-            k1x, k1u = acc(x, u, A, Q, C)
-            x2, u2 = x + 0.5*h*vx, u + 0.5*h*vu
-            k2x, k2u = acc(x2, u2, A, Q, C)
-            x2v, u2v = vx + 0.5*h*k1x, vu + 0.5*h*k1u
-            x3, u3 = x + 0.5*h*x2v, u + 0.5*h*u2v
-            k3x, k3u = acc(x3, u3, A, Q, C)
-            x3v, u3v = vx + 0.5*h*k2x, vu + 0.5*h*k2u
-            x4, u4 = x + h*x3v, u + h*u3v
-            k4x, k4u = acc(x4, u4, A, Q, C)
-            x4v, u4v = vx + h*k3x, vu + h*k3u
-            p1, t1 = rates(x, u, A, ell); p2, t2 = rates(x2, u2, A, ell)
-            p3, t3 = rates(x3, u3, A, ell); p4, t4 = rates(x4, u4, A, ell)
+            hc = h[:, None]
+            k1x, k1N = acc(x, N, V, A, Q)
+            x2, N2 = x + 0.5*h*vx, N + 0.5*hc*V
+            x2v, N2v = vx + 0.5*h*k1x, V + 0.5*hc*k1N
+            k2x, k2N = acc(x2, N2, N2v, A, Q)
+            x3, N3 = x + 0.5*h*x2v, N + 0.5*hc*N2v
+            x3v, N3v = vx + 0.5*h*k2x, V + 0.5*hc*k2N
+            k3x, k3N = acc(x3, N3, N3v, A, Q)
+            x4, N4 = x + h*x3v, N + hc*N3v
+            x4v, N4v = vx + h*k3x, V + hc*k3N
+            k4x, k4N = acc(x4, N4, N4v, A, Q)
+            p1, t1 = rates(x, N[:, 2], A, ell); p2, t2 = rates(x2, N2[:, 2], A, ell)
+            p3, t3 = rates(x3, N3[:, 2], A, ell); p4, t4 = rates(x4, N4[:, 2], A, ell)
             Ip_new = Ip + h/6*(p1 + 2*p2 + 2*p3 + p4)
             It_new = It + h/6*(t1 + 2*t2 + 2*t3 + t4)
             x_new = x + h/6*(vx + 2*x2v + 2*x3v + x4v)
-            u_new = u + h/6*(vu + 2*u2v + 2*u3v + u4v)
+            N_new = N + hc/6*(V + 2*N2v + 2*N3v + N4v)
             vx = vx + h/6*(k1x + 2*k2x + 2*k3x + k4x)
-            vu = vu + h/6*(k1u + 2*k2u + 2*k3u + k4u)
+            V = V + hc/6*(k1N + 2*k2N + 2*k3N + k4N)
+            u, u_new = N[:, 2], N_new[:, 2]
             crossed = ((u > 0) != (u_new > 0)) & (x > 0) & (x < x_h) & (hits < crossings)
             if crossed.any():
                 i = np.nonzero(crossed)[0]
                 f = u[i] / (u[i] - u_new[i])
+                Nc = N[i] + f[:, None]*(N_new[i] - N[i])
                 out[0, hits[i], idx[i]] = 1 / (x[i] + f*(x_new[i] - x[i]))
-                out[1, hits[i], idx[i]] = Ip[i] + f*(Ip_new[i] - Ip[i])
+                # forward phi change: the regular part, plus the sphere point's azimuth (the
+                # backward ray started at azimuth 0); only phi modulo 2 pi is used
+                out[1, hits[i], idx[i]] = Ip[i] + f*(Ip_new[i] - Ip[i]) - np.arctan2(Nc[:, 1], Nc[:, 0])
                 out[2, hits[i], idx[i]] = It[i] + f*(It_new[i] - It[i])
                 hits[i] += 1
-            x, u, Ip, It = x_new, u_new, Ip_new, It_new
+            x, N, Ip, It = x_new, N_new, Ip_new, It_new
     return out
 
 
