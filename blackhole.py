@@ -714,9 +714,9 @@ def render_still(d, path, res_scale=2):
 
 
 # --- Choosing parameters ------------------------------------------------------------
-def add_param_args(ap):
+def add_param_args(ap, presets=None):
     g = ap.add_argument_group('black hole parameters')
-    g.add_argument('--preset', default='luminet1979', choices=sorted(PRESETS),
+    g.add_argument('--preset', default='luminet1979', choices=sorted(presets or PRESETS),
                    help='starting point (default: luminet1979, the exact 1979 recreation)')
     g.add_argument('--params', metavar='FILE', help='JSON file of parameter values, applied after the preset')
     g.add_argument('--set', metavar='NAME=VALUE', action='append', default=[],

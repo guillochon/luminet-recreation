@@ -152,3 +152,25 @@ The output resolution is a render option, not a parameter: `--res-scale` for `bl
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Two black holes merging
+
+```bash
+python merger.py
+```
+
+This writes `merger.png`: two equal black holes at the moment their horizons touch, inside a thin disk, drawn in the same ink style and from Luminet's viewpoint. It takes about a minute.
+
+![Merger](merger.png)
+
+- **The spacetime.** No exact solution exists for two orbiting black holes this close, so the holes' fields are added together. Each hole is a non-spinning (Schwarzschild) black hole written in Kerr-Schild form and boosted to its orbital speed, and the two are summed: g = η + H₁ l₁l₁ + H₂ l₂l₂. This is the approach of Combi & Ressler 2024 ([arXiv:2403.13308](https://arxiv.org/abs/2403.13308)). The holes are placed where their horizons touch, 2M apart (M is the total mass), on a circular orbit at the Keplerian rate. Each moves at 0.35c. The separation is held fixed, so the inspiral during the ~10M a ray spends near the holes is ignored.
+- **The light.** Every pixel's ray is traced back from a camera 1000M away by integrating the full geodesic equations, so the holes keep moving while the light passes them. The metric is unchanged by a time shift combined with a rotation (a helical symmetry). So p_t + Ω p_φ is conserved along every ray, which takes the place of integrating p_t.
+- **The disk.** It's a thin disk around both holes, in their orbital plane, turning the same way they orbit. It runs from 6M (the innermost stable orbit for the total mass) outward, with the same Page–Thorne brightness and sharp inner edge as the 1979 image. The redshift comes from each ray's own momentum and the gas's 4-velocity: 1+z = (p·u)_gas / (p·u)_camera.
+- **What it shows.** At this separation the two holes have a single shared shadow, not two dents. Shadows merge long before the horizons do. The shared shadow is about 12.6M wide and 11.9M tall, against 10.4M for a single hole of mass M. It is lopsided like a spinning hole's, from −5.7M to +6.9M across, because the orbital angular momentum acts like a spin of about 0.35. In the drawing, compared with the 1979 one, the dark region is larger and the gap between the direct and secondary images on the bright side is wider. Moving the holes apart (`--set separation=8`) splits the shadow in two. Seen end-on (`--set phase=90`), the front hole bends the back one's shadow into a ring.
+- **Pulled apart.** `python merger.py --preset separated --out binary.png` puts the holes 12M apart. Each orbits at 0.14c, and the remaining inspiral takes about 1600M, so holding the separation fixed is a good approximation here. The disk is cleared out to 18M (1.5 times the separation), as a binary's tides clear the middle of a disk around it. Each hole now casts its own shadow against the light it bends from the far side of the disk, with a lensed ring around it. The ring is brighter around the left hole, which is moving toward the camera. Between the two holes, light bent by both is pinched into a bright cusp. The disk's inner edge must stay outside the holes' orbits, and `merger.py` refuses one that doesn't.
+
+![Binary](binary.png)
+
+- **Where the sum breaks down.** Close to the point where the horizons touch, within about 1.1M, the summed metric stops being a valid spacetime: its determinant changes sign. That region is deep inside the shared shadow, and rays that reach it are counted as falling in.
+- **Options.** `separation` (0 gives one hole of mass M), `mass_ratio`, `phase` (0 = side by side, 90 = the heavier hole in front), `center_x` and `center_y` (pan the frame, in M), plus every option of the stills. List them with `python merger.py --list-params`.
+- **Checks.** With `separation=0` the tracer matches the Schwarzschild code above to about 10⁻⁶ in disk radius and redshift. The shadow's size doesn't change when the integration step is halved or the cutoff near the breakdown region is changed tenfold.
