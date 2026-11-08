@@ -58,6 +58,8 @@ class MergerParams(bh.Params):
     separation: float = _p(None, "distance between the holes, in M; default (touching) is where their horizons touch, "
                                  "2 m1 + 2 m2 = 2M; 0 = a single hole of mass M")
     mass_ratio: float = _p(1.0, "m2 / m1, from 0.05 to 1")
+    spin1: float = _p(0.0, "spin of the heavier hole, chi = a/m, from -0.99 to 0.99; positive turns with the orbit")
+    spin2: float = _p(0.0, "spin of the lighter hole, chi = a/m, from -0.99 to 0.99; positive turns with the orbit")
     phase: float = _p(0.0, "orbital phase as the light passes the holes, in degrees: 0 = side by side with the heavier "
                            "hole on the right (receding), 90 = heavier hole in front")
     center_x: float = _p(0.0, "where the frame is centered on the sky, horizontally, in M (pans the view; 0 = on the binary)")
@@ -74,7 +76,9 @@ class MergerParams(bh.Params):
     def validate(self):
         super().validate()
         if self.spin != 0:
-            raise ValueError("merger.py's holes do not spin; leave spin at 0")
+            raise ValueError("use spin1 and spin2 for the holes' spins; leave spin at 0")
+        if not (abs(self.spin1) <= 0.99 and abs(self.spin2) <= 0.99):
+            raise ValueError("spin1 and spin2 must be in [-0.99, 0.99]")
         if not 0.05 <= self.mass_ratio <= 1:
             raise ValueError("mass_ratio must be in [0.05, 1]")
         if self.separation < 0:
@@ -97,8 +101,9 @@ PRESETS = {**bh.PRESETS,
 # --- The binary --------------------------------------------------------------------
 class Binary:
     """Two holes on a circular orbit in the z = 0 plane, counterclockwise seen from +z."""
-    def __init__(self, d, q):
+    def __init__(self, d, q, spins=(0.0, 0.0)):
         self.m = (1 / (1 + q), q / (1 + q))                 # m1 >= m2, total 1
+        self.a = (spins[0] * self.m[0], spins[1] * self.m[1])   # Kerr a = chi m, along +z (with the orbit)
         self.d = d
         self.omega = np.sqrt(1 / d**3) if d > 0 else 0.0
         self.radius = (d * self.m[1], -d * self.m[0])       # signed distance of each hole from the center of mass
@@ -113,30 +118,55 @@ class Binary:
         return X, V
 
 
-def hole_terms(x, X, V, m, derivs=True):
+def hole_terms(x, X, V, m, a=0.0, derivs=True):
     """Kerr-Schild pieces of one moving hole at points x (3, N): H, l_mu = (l_t, l_s)
-    and, if derivs, their spatial derivatives, packed as what the geodesic equation needs.
+    and, if derivs, their spatial derivatives dH (3, N), dlt (3, N) and dls (3, 3, N),
+    indexed [j, ...] for d/dx^j.
 
-    In the hole's rest frame, s' = A s with A = 1 + kappa v v^T (kappa = gamma^2/(gamma+1)),
-    r' = |s'|, n = s'/r', H = 2m/r', l' = (1, SIGMA n); boosting l' back gives
-        l_t = gamma (1 - SIGMA v.n),    l_s = SIGMA A n - gamma v.
-    """
+    In the hole's rest frame (s' = A s, A = 1 + kappa v v^T, kappa = gamma^2/(gamma+1);
+    the spin a = chi m points along z, perpendicular to the motion), the Kerr metric is
+    eta + H l' l' with r the Kerr radius, r^4 - (R^2 - a^2) r^2 - a^2 z^2 = 0, and
+        H = 2 m r^3 / (r^4 + a^2 z^2),
+        l' = (1, SIGMA (r x - a y)/(r^2 + a^2), SIGMA (r y + a x)/(r^2 + a^2), SIGMA z/r),
+    the outgoing form for a hole spinning counterclockwise (with the orbit) when a > 0.
+    Boosting l' back gives l_t = gamma (1 - v.l'_s), l_s = A l'_s - gamma v."""
     s = x - X
     v2 = np.sum(V * V, 0)
     g = 1 / np.sqrt(1 - v2)
     kap = g * g / (g + 1)
-    sv = np.sum(s * V, 0)
-    sp = s + kap * sv * V
-    r = np.sqrt(np.sum(sp * sp, 0))
-    n = sp / r
-    nv = np.sum(n * V, 0)
-    w = n + kap * nv * V                                    # A n
-    H = 2 * m / r
-    lt = g * (1 - SIGMA * nv)
-    ls = SIGMA * w - g * V
+    sp = s + kap * np.sum(s * V, 0) * V
+    px, py, pz = sp
+    a2 = a * a
+    w = np.sum(sp * sp, 0) - a2
+    r2 = 0.5 * (w + np.sqrt(w * w + 4 * a2 * pz * pz))
+    r = np.sqrt(r2)
+    den = r2 + a2
+    Hden = r2 * r2 + a2 * pz * pz
+    H = 2 * m * r * r2 / Hden
+    lp = SIGMA * np.stack([(r * px - a * py) / den, (r * py + a * px) / den, pz / r])
+    lt = g * (1 - np.sum(V * lp, 0))
+    ls = lp + kap * np.sum(lp * V, 0) * V - g * V
     out = dict(r=r, H=H, lt=lt, ls=ls)
-    if derivs:
-        out.update(g=g, V=V, nv=nv, w=w)
+    if not derivs:
+        return out
+    # rest-frame gradients d'_k
+    D = r * (2 * r2 - w)
+    ez = np.array([0.0, 0.0, 1.0])[:, None]
+    dr = (sp * r2 + a2 * pz * ez) / D
+    dHp = 2 * m * (3 * r2 * dr * Hden - r * r2 * (4 * r * r2 * dr + 2 * a2 * pz * ez)) / (Hden * Hden)
+    e = np.eye(3)[:, :, None]
+    J = np.empty((3, 3) + r.shape)                          # J[k, n] = d'_k l'_n
+    J[:, 0] = (dr * px + r * e[:, 0] - a * e[:, 1]) / den - (r * px - a * py) * 2 * r * dr / (den * den)
+    J[:, 1] = (dr * py + r * e[:, 1] + a * e[:, 0]) / den - (r * py + a * px) * 2 * r * dr / (den * den)
+    J[:, 2] = (e[:, 2] * r - pz * dr) / r2
+    J *= SIGMA
+    # global gradients: d_j = A_jk d'_k (A is symmetric)
+    dH = dHp + kap * V * np.sum(V * dHp, 0)
+    dlp = J + kap * V[:, None] * np.einsum('kN,knN->nN', V, J)[None]
+    vdl = np.einsum('nN,jnN->jN', V, dlp)                   # v . d_j l'_s
+    dlt = -g * vdl
+    dls = dlp + kap * V[None] * vdl[:, None]
+    out.update(dH=dH, dlt=dlt, dls=dls)
     return out
 
 
@@ -170,19 +200,14 @@ def force(k_t, k_s, T):
     1/2 d_j H (k.l)^2 + H (k.l) (k^a d_j l_a)."""
     F = 0.0
     for h in T:
-        r, H, g, V, nv, w = h['r'], h['H'], h['g'], h['V'], h['nv'], h['w']
         kl = k_t * h['lt'] + np.sum(k_s * h['ls'], 0)
-        kv = np.sum(k_s * V, 0)
-        kw = np.sum(k_s * w, 0)
-        dH = -H * w / r
-        # k^a d_j l_a, with d_j n_k = (A_kj - n_k w_j)/r' and A A = 1 + gamma^2 v v^T
-        kdl = (-g * SIGMA * k_t * (g * V - nv * w) + SIGMA * (k_s + g * g * kv * V - kw * w)) / r
-        F = F + 0.5 * dH * kl * kl + H * kl * kdl
+        kdl = k_t * h['dlt'] + np.einsum('mN,jmN->jN', k_s, h['dls'])
+        F = F + 0.5 * h['dH'] * kl * kl + h['H'] * kl * kdl
     return F
 
 
 def metric_terms(binary, t, x, derivs=True):
-    return [hole_terms(x, *binary.hole(i, t), binary.m[i], derivs) for i in (0, 1)]
+    return [hole_terms(x, *binary.hole(i, t), binary.m[i], binary.a[i], derivs) for i in (0, 1)]
 
 
 # --- Rays ------------------------------------------------------------------------
@@ -222,7 +247,7 @@ def trace_rays(p, binary_args, X, Y):
     radius where it first meets the disk (NaN if never), how many times it had
     crossed the disk plane before that, the redshift 1+z of the light, and which
     hole swallowed it (0 = heavier, 1 = lighter, 2 = still orbiting at max_steps, -1 = none)."""
-    binary = Binary(*binary_args[:2]); binary.psi0 = binary_args[2]
+    binary = Binary(*binary_args[:2], spins=tuple(binary_args[3:5]) or (0.0, 0.0)); binary.psi0 = binary_args[2]
     N = X.size
     x, t, p_s, p_t, E_cam = initial_rays(p, binary, X, Y)
     C = p_t + binary.omega * (x[0] * p_s[1] - x[1] * p_s[0])   # conserved: p_t + Omega p_phi
@@ -243,7 +268,9 @@ def trace_rays(p, binary_args, X, Y):
         kt1, ks1, F1, T = rhs(t, x, p_s, C)
         r_near = np.minimum(T[0]['r'] / (2 * m[0]), T[1]['r'] / (2 * m[1]))
         r_hole = np.minimum(T[0]['r'], T[1]['r'])
-        done = (r_near < 0.5) | (lorentzian_margin(T) < MIN_MARGIN) | ~np.isfinite(kt1)   # fallen in
+        # fallen in: inside r = m, between a Kerr hole's two horizons (r = m +- sqrt(m^2 - a^2)), or where
+        # the summed metric breaks down
+        done = (r_near < 0.5) | (lorentzian_margin(T) < MIN_MARGIN) | ~np.isfinite(kt1)
         out = (np.sum(x * x, 0) > (1.05 * D)**2)            # escaped past the camera's distance
         keep = ~(done | out)
         if not keep.all():
@@ -341,9 +368,9 @@ def binary_image(p, verbose=True, workers=None):
     W = p.grid_w; H = int(round(W / p.aspect))
     xs = np.linspace(-VIEW, VIEW, W); ys = np.linspace(-VIEW_H, VIEW_H, H)
     X, Y = np.meshgrid(xs, ys)
-    binary = Binary(p.separation, p.mass_ratio)
+    binary = Binary(p.separation, p.mass_ratio, (p.spin1, p.spin2))
     psi0 = phase_offset(p, binary) if binary.d > 0 else 0.0
-    args = (binary.d, p.mass_ratio, psi0)
+    args = (binary.d, p.mass_ratio, psi0, p.spin1, p.spin2)
     Xf, Yf = X.ravel() + p.center_x, Y.ravel() + p.center_y          # where on the sky each cell looks
     workers = workers or max(1, min(8, (os.cpu_count() or 2) - 1))
     chunks = np.array_split(np.random.default_rng(0).permutation(len(Xf)), workers * 6)   # mixed, for even loads
@@ -416,7 +443,7 @@ def params_from_args(args):
             raise SystemExit(f"unknown parameter {k!r}; see --list-params")
         if k == 'separation' and (v is None or str(v).lower() in ('touching', 'auto', 'none', '')):
             return None
-        if k in ('separation', 'mass_ratio', 'phase', 'camera_distance', 'step', 'center_x', 'center_y'):
+        if k in ('separation', 'mass_ratio', 'spin1', 'spin2', 'phase', 'camera_distance', 'step', 'center_x', 'center_y'):
             return float(v)
         if k == 'max_steps':
             return int(v)
