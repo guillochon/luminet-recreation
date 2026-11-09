@@ -316,9 +316,10 @@ class Dots:
     the dot's current azimuth is that label + Omega(r) t."""
     FIELDS = ('lay', 'r', 'phi0', 'born', 'rank', 'size', 'ang', 'off', 'dying')
 
-    def __init__(self, p, seed, rotation=1.0):
+    def __init__(self, p, seed, rotation=1.0, layers=(0, 1)):
         self.p = p
         self.rotation = rotation                         # 1 = the physical rotation speed
+        self.layers = layers                             # image layers (0 = direct, 1 = secondary, ...)
         self.rng = np.random.default_rng(seed)
         self.spacing = p.dot_spacing * VIEW / 30
         for k in self.FIELDS:
@@ -331,12 +332,11 @@ class Dots:
         for k in self.FIELDS:
             setattr(self, k, getattr(self, k)[keep])
 
-    @staticmethod
-    def jacobians(layer, Lx, Ly):
+    def jacobians(self, layer, Lx, Ly):
         """Per image layer: how the disk-plane position changes per screen pixel
         (d/dj, d/di of Lx and Ly), using only pixels of that layer."""
         J = {}
-        for n in (0, 1):
+        for n in self.layers:
             ok = layer == n
             Lxn, Lyn = np.where(ok, Lx, np.nan), np.where(ok, Ly, np.nan)
             J[n] = (np.gradient(Lxn, axis=1), np.gradient(Lxn, axis=0),
@@ -351,7 +351,7 @@ class Dots:
         H, W = layer.shape
         dx, dy = xs[1] - xs[0], ys[1] - ys[0]
         pos = np.full((len(self.r), 2), np.nan)
-        for n in (0, 1):
+        for n in self.layers:
             ok = layer == n
             mine = np.nonzero(self.lay == n)[0]
             if not ok.any() or len(mine) == 0:
@@ -397,7 +397,7 @@ class Dots:
         fj = (pts[:, 0] - xs[j]) / (xs[1] - xs[0]); fi = (pts[:, 1] - ys[i]) / (ys[1] - ys[0])
         lay = layer[i, j]
         lx = np.full(len(pts), np.nan); ly = lx.copy()
-        for n in (0, 1):
+        for n in self.layers:
             m = lay == n
             Jxj, Jxi, Jyj, Jyi = J[n]
             lx[m] = Lx[i[m], j[m]] + Jxj[i[m], j[m]]*fj[m] + Jxi[i[m], j[m]]*fi[m]

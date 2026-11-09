@@ -447,18 +447,29 @@ def trace_rays(p, binary, X, Y, constraint=False):
 
     When the binary has a helical symmetry, p_t comes from the conserved p_t + Omega p_phi;
     otherwise p_t is integrated, dp_t/dlambda = 1/2 k^a k^b d_t g_ab."""
-    helical = binary.helical
-    N = X.size
     x, t, p_s, p_t, E_cam = initial_rays(p, binary, X, Y)
+    out = trace_from(p, binary, x, t, p_s, p_t, E_cam, 1.05 * p.camera_distance, constraint)
+    res = (out['rho'], out['n_cross'], out['opz'], out['captor'])
+    return res + (out['constraint'],) if constraint else res
+
+
+def trace_from(p, binary, x, t, p_s, p_t, E_cam, r_escape, constraint=False):
+    """Trace rays backward from positions x (3, N) at times t with covariant momenta
+    (p_t, p_s), where the camera measures energy E_cam, until they meet the disk, fall
+    in or pass r_escape. Returns a dict of per-ray arrays: rho, phi and t where the
+    ray met the disk (NaN if never), n_cross (disk-plane crossings before that), opz
+    (1+z), captor (see trace_rays) and, with constraint, the null-condition check."""
+    helical = binary.helical
+    N = x.shape[1]
     w = binary.omega if helical else 0.0
     Q = p_t + w * (x[0] * p_s[1] - x[1] * p_s[0])            # helical: conserved; otherwise p_t itself
     rho_hit = np.full(N, np.nan); n_cross = np.zeros(N, int); opz = np.full(N, np.nan)
+    phi_hit = np.full(N, np.nan); t_hit = np.full(N, np.nan)
     captor = np.full(N, -1, np.int8)                        # which hole swallowed the ray (-1: none)
     cons = np.zeros(N)
     idx = np.arange(N)
     crossings = np.zeros(N, int)
     m = binary.m
-    D = p.camera_distance
 
     def pt_of(x, ps, Q):
         return Q - w * (x[0] * ps[1] - x[1] * ps[0])
@@ -477,8 +488,11 @@ def trace_rays(p, binary, X, Y, constraint=False):
         # fallen in: inside r = m, between a Kerr hole's two horizons (r = m +- sqrt(m^2 - a^2)), or where
         # the summed metric breaks down
         done = (r_near < 0.5) | (lorentzian_margin(T) < MIN_MARGIN) | ~np.isfinite(kt1)
-        out = (np.sum(x * x, 0) > (1.05 * D)**2)            # escaped past the camera's distance
-        keep = ~(done | out)
+        # escaped: past r_escape and either beyond the disk or heading away from its plane (backward in
+        # time a ray moves along -k)
+        R2 = np.sum(x * x, 0)
+        gone = (R2 > r_escape**2) & ((x[2] * ks1[2] <= 0) | (R2 > (1.05 * p.r_out)**2))
+        keep = ~(done | gone)
         if not keep.all():
             captor[idx[done]] = np.where(T[0]['r'][done] / m[0] <= T[1]['r'][done] / m[1], 0, 1)
             idx, x, t, p_s, Q, crossings = idx[keep], x[:, keep], t[keep], p_s[:, keep], Q[keep], crossings[keep]
@@ -518,6 +532,7 @@ def trace_rays(p, binary, X, Y, constraint=False):
                 Qc = Q[j] + f[hit] * (Q_new[j] - Q[j])
                 xc = xc[:, hit]
                 rho_hit[idx[j]] = rho[hit]
+                phi_hit[idx[j]] = np.arctan2(xc[1], xc[0]); t_hit[idx[j]] = tc
                 n_cross[idx[j]] = crossings[j]
                 opz[idx[j]] = emitted_energy(binary, tc, xc, pc, pt_of(xc, pc, Qc)) / E_cam[idx[j]]
             crossings[i] += 1
@@ -530,9 +545,8 @@ def trace_rays(p, binary, X, Y, constraint=False):
         if len(idx) == 0:
             break
     captor[idx] = 2                                         # still orbiting at the step limit
-    if constraint:
-        return rho_hit, n_cross, opz, captor, cons
-    return rho_hit, n_cross, opz, captor
+    return dict(rho=rho_hit, phi=phi_hit, t=t_hit, n_cross=n_cross, opz=opz, captor=captor,
+                constraint=cons if constraint else None)
 
 
 def emitted_energy(binary, t, x, p_s, p_t):
@@ -574,19 +588,20 @@ def light_arrival_time(p, d, q):
     raise RuntimeError("reference ray never reached the center")
 
 
-def make_binary(p):
+def make_binary(p, t_ref=None, t_range=None):
     """The binary for parameters p, with the holes at orbital phase p.phase (in the
     orbital plane) as the light passes them. psi is the heavier hole's angle from +x
     (screen right); the camera is toward -y, so phase 0 (psi = 0) is side by side and
     phase 90 (psi = -90 deg) puts it in front."""
     d, q = p.separation, p.mass_ratio
-    t_ref = light_arrival_time(p, d, q) if d > 0 else 0.0
+    if t_ref is None:
+        t_ref = light_arrival_time(p, d, q) if d > 0 else 0.0
     spin = dict(spins=(p.spin1, p.spin2), tilts=(p.tilt1, p.tilt2), azimuths=(p.spin_az1, p.spin_az2),
                 psi=np.radians(-p.phase), t_ref=t_ref)
     binary = Binary(d, q, **spin)
     if not binary.helical and p.precess and d > 0:
         D = p.camera_distance
-        binary = PrecessingBinary(d, q, **spin, t_range=(-2.5 * D, 1.5 * D))
+        binary = PrecessingBinary(d, q, **spin, t_range=t_range or (-2.5 * D, 1.5 * D))
     return binary
 
 
